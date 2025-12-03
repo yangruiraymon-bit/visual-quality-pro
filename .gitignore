@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.DS_Store
+
+# Environments
+.venv/
+venv/
+env/
+
+# Streamlit cache
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
