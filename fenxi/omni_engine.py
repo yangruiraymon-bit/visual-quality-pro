@@ -464,7 +464,6 @@ class AestheticDiagnostician:
         comp_score = (data.composition_diagonal + data.composition_thirds + 
                       data.composition_balance + data.composition_symmetry) / 4
         
-        # 色彩分
         color_score = (data.color_clarity * 100 * 0.4 + 
                        data.color_saturation * 100 * 0.3 + 
                        data.color_contrast * 100 * 0.3)
@@ -475,6 +474,9 @@ class AestheticDiagnostician:
         else:
             fg_score = min(100, data.fg_color_diff) * 0.6 + data.fg_area_diff * 100 * 0.4
             
+        if data.color_clarity > 0.85:
+            color_score = color_score * 0.6
+
         total_score = int(w_comp * comp_score + w_color * color_score + w_fg * fg_score)
 
         # 评级
@@ -496,12 +498,17 @@ class AestheticDiagnostician:
         pros, cons, suggestions = [], [], []
         
         if data.composition_symmetry > 90: pros.append("极佳的视觉秩序感")
-        if data.color_clarity > 0.3: pros.append("光影通透")
         if data.fg_color_diff > 100: pros.append("主体色彩醒目")
+        if data.color_clarity > 0.85:
+            cons.append("高光溢出严重（过曝），亮部细节大量丢失。")
+            suggestions.append("调色建议：降低曝光度或高光，找回亮部细节。")
+        elif data.color_clarity > 0.3:
+            pros.append("光影通透，高光区域充足，视觉传达效率高。")
+        elif data.color_clarity < 0.1:
+            cons.append("画面整体灰暗沉闷，存在明显的‘雾霾感’。")
+            suggestions.append("调色建议：提升高光亮度或使用去雾工具，增加画面通透感。")
         
-        if data.color_clarity < 0.1: 
-            cons.append("画面沉闷雾感重")
-            suggestions.append("建议提高高光亮度或去雾")
+        
         if data.composition_balance < 40:
             cons.append("物理重心失衡")
             suggestions.append("调整主体位置平衡左右")

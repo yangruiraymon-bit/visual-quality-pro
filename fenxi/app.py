@@ -244,6 +244,14 @@ if uploaded_file:
             if getattr(data, 'vis_clarity', None) is not None:
                 st.image(data.vis_clarity, use_container_width=True, caption="清晰度分布图 (聚光灯效果)")
             score_clarity = data.color_clarity
+            if score_clarity > 0.85:
+                st.error("💥 **严重过曝**：高光溢出，画面细节丢失，视觉刺眼。")
+            elif score_clarity > 0.3:
+                st.success("☀️ **通透清晰**：画面有充足的高光区域，视觉传达效率高。")
+            elif score_clarity > 0.1:
+                st.info("☁️ **柔和/自然**：光照分布均匀，可能具有电影感或胶片感。")
+            else:
+                st.warning("🌫️ **沉闷/雾感**：高光缺失，画面可能显得灰暗或对焦不清。")
 
     # --- Tab 3: 图底 & 文字 ---
     with tab3:
