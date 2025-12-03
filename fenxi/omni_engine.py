@@ -101,7 +101,7 @@ class HybridSegmenter:
                 })
         return candidates
 
-    def extract_mask(self, image_bgr: np.ndarray, config: Dict) -> np.ndarray:
+    def extract_mask(self, image_bgr: np.ndarray, config: Dict, text_boxes: List = None) -> np.ndarray:
         h, w = image_bgr.shape[:2]
         
         # 参数读取
@@ -124,6 +124,16 @@ class HybridSegmenter:
                         m = cv2.resize(m, (w, h))
                     bin_m = (m > 0.5).astype(np.uint8) * 255
                     semantic_masks.append(bin_m)
+
+        # 2.B 文字框作为语义对象加入
+        if text_boxes:
+            for box in text_boxes:
+                pts = np.array(box, dtype=np.int32)
+                rect_area = cv2.contourArea(pts)
+                if rect_area > (h * w * 0.015):
+                    txt_mask = np.zeros((h, w), dtype=np.uint8)
+                    cv2.fillPoly(txt_mask, [pts], 255)
+                    semantic_masks.append(txt_mask)
 
         # 3. 融合逻辑
         final_mask = np.zeros((h, w), dtype=np.uint8)
@@ -208,8 +218,12 @@ class OmniVisualEngine:
         img_hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
         img_luv = cv2.cvtColor(img_small, cv2.COLOR_BGR2Luv)
         
+        # --- 1.5 OCR 先行，获取文字框传入分割器 ---
+        ocr_raw = self.reader.readtext(img_small)
+        text_boxes_for_seg = [item[0] for item in ocr_raw]
+
         # --- 2. AI 主体分割 ---
-        binary_mask = self.segmenter.extract_mask(img_small, config)
+        binary_mask = self.segmenter.extract_mask(img_small, config, text_boxes=text_boxes_for_seg)
         binary_mask_inv = cv2.bitwise_not(binary_mask)
         
         # 初始化图
@@ -369,7 +383,7 @@ class OmniVisualEngine:
         draw = ImageDraw.Draw(vis_pil)
         font = self._load_safe_font(16)
         
-        ocr_results = self.reader.readtext(img_small)
+        ocr_results = ocr_raw
         text_scores = []
         text_contrasts = []
         
