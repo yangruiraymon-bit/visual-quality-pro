@@ -32,6 +32,7 @@ class OmniReport:
     fg_text_present: bool
     fg_text_legibility: float
     fg_text_contrast: float
+    fg_text_content: Optional[str] = None
 
     # 可视化图像数据
     vis_mask: Optional[np.ndarray] = None
@@ -218,9 +219,21 @@ class OmniVisualEngine:
         img_hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
         img_luv = cv2.cvtColor(img_small, cv2.COLOR_BGR2Luv)
         
-        # --- 1.5 OCR 先行，获取文字框传入分割器 ---
         ocr_raw = self.reader.readtext(img_small)
         text_boxes_for_seg = [item[0] for item in ocr_raw]
+        text_group_contours = []
+        if len(ocr_raw) > 0:
+            txt_mask_temp = np.zeros((new_h, process_w), dtype=np.uint8)
+            for (bbox, _, prob) in ocr_raw:
+                if float(prob) < 0.3:
+                    continue
+                pts = np.array(bbox, dtype=np.int32)
+                cv2.fillPoly(txt_mask_temp, [pts], 255)
+            kernel_w = max(3, int(process_w * 0.04))
+            kernel_h = max(3, int(new_h * 0.02))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h))
+            txt_mask_dilated = cv2.dilate(txt_mask_temp, kernel, iterations=1)
+            text_group_contours, _ = cv2.findContours(txt_mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         # --- 2. AI 主体分割 ---
         binary_mask = self.segmenter.extract_mask(img_small, config, text_boxes=text_boxes_for_seg)
@@ -271,20 +284,24 @@ class OmniVisualEngine:
                     continue
                 cx_g = int(M_sub["m10"] / M_sub["m00"])
                 cy_g = int(M_sub["m01"] / M_sub["m00"])
-                visual_elements.append({"type": "graphic", "centroid": (cx_g, cy_g), "area": area, "color": (0, 0, 255)})
-            for (bbox, text, prob) in ocr_raw:
-                if float(prob) < 0.3:
+                is_text_area = False
+                for t_cnt in text_group_contours:
+                    if cv2.pointPolygonTest(t_cnt, (cx_g, cy_g), False) >= 0:
+                        is_text_area = True
+                        break
+                if not is_text_area:
+                    visual_elements.append({"type": "graphic", "centroid": (cx_g, cy_g), "area": area, "color": (0, 0, 255)})
+            for t_cnt in text_group_contours:
+                area_t = cv2.contourArea(t_cnt)
+                if area_t < (new_h * process_w * 0.005):
                     continue
-                pts = np.array(bbox, dtype=np.int32)
-                M_txt = cv2.moments(pts)
+                M_txt = cv2.moments(t_cnt)
                 if M_txt["m00"] == 0:
                     continue
                 cx_t = int(M_txt["m10"] / M_txt["m00"])
                 cy_t = int(M_txt["m01"] / M_txt["m00"])
-                area_t = cv2.contourArea(pts)
-                if area_t < (new_h * process_w * 0.002):
-                    continue
-                visual_elements.append({"type": "text", "centroid": (cx_t, cy_t), "area": area_t * 2.0, "color": (0, 165, 255)})
+                visual_elements.append({"type": "text", "centroid": (cx_t, cy_t), "area": area_t * 2.5, "color": (0, 165, 255)})
+                cv2.drawContours(vis_thirds, [t_cnt], -1, (0, 165, 255), 1)
             total_weight = 0.0
             weighted_score_sum = 0.0
             for item in visual_elements:
@@ -423,8 +440,14 @@ class OmniVisualEngine:
         ocr_results = ocr_raw
         text_scores = []
         text_contrasts = []
+        detected_texts = []
         
         for (bbox, text_content, prob) in ocr_results:
+            try:
+                if float(prob) > 0.3:
+                    detected_texts.append(str(text_content))
+            except:
+                pass
             pts = np.array(bbox, dtype=np.int32)
             x, y, w_box, h_box = cv2.boundingRect(pts)
             x, y = max(0, x), max(0, y)
@@ -464,6 +487,7 @@ class OmniVisualEngine:
         has_text = len(text_scores) > 0
         avg_text_score = float(np.mean(text_scores)) if has_text else 0.0
         avg_text_contrast = float(np.mean(text_contrasts)) if has_text else 0.0
+        text_content_str = " | ".join(detected_texts) if detected_texts else "无"
         vis_text_final = np.array(vis_pil)
 
         return OmniReport(
@@ -482,6 +506,7 @@ class OmniVisualEngine:
             fg_text_present=has_text,
             fg_text_legibility=round(avg_text_score, 1),
             fg_text_contrast=round(avg_text_contrast, 1),
+            fg_text_content=text_content_str,
             
             vis_mask=binary_mask,
             vis_edge_fg=vis_edge_fg,
