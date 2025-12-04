@@ -251,23 +251,45 @@ class OmniVisualEngine:
             cv2.circle(vis_diag, (cx, cy), 6, (0, 0, 255), -1)
             cv2.putText(vis_diag, f"Diag: {int(score_diag)}", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # A2. 三分法
+            # === [升级版] A2. 三分法 (多主体判定) ===
             w3, h3 = int(process_w/3), int(new_h/3)
-            # 绘图略... (保持原样)
             grid_color = (0, 255, 255)
             cv2.line(vis_thirds, (w3, 0), (w3, new_h), grid_color, 1)
             cv2.line(vis_thirds, (2*w3, 0), (2*w3, new_h), grid_color, 1)
             cv2.line(vis_thirds, (0, h3), (process_w, h3), grid_color, 1)
             cv2.line(vis_thirds, (0, 2*h3), (process_w, 2*h3), grid_color, 1)
-            
-            targets = [(w3, h3), (2*w3, h3), (w3, 2*h3), (2*w3, 2*h3)]
-            dists = [np.sqrt((cx-tx)**2 + (cy-ty)**2) for tx, ty in targets]
-            score_thirds = max(0, 100 * (1 - min(dists) / (diag_len * th_thirds)))
-            
-            best_idx = dists.index(min(dists))
-            tx, ty = targets[best_idx]
-            cv2.circle(vis_thirds, (cx, cy), 6, (0, 0, 255), -1)
-            cv2.line(vis_thirds, (cx, cy), (tx, ty), (0, 255, 0), 2)
+            lines_x = [w3, 2*w3]
+            lines_y = [h3, 2*h3]
+            sub_contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            total_area_weight = 0
+            weighted_score_sum = 0
+            for cnt in sub_contours:
+                area = cv2.contourArea(cnt)
+                if area < (new_h * process_w * 0.005):
+                    continue
+                M_sub = cv2.moments(cnt)
+                if M_sub["m00"] == 0:
+                    continue
+                sub_cx = int(M_sub["m10"] / M_sub["m00"])
+                sub_cy = int(M_sub["m01"] / M_sub["m00"])
+                dist_x = min([abs(sub_cx - lx) for lx in lines_x])
+                dist_y = min([abs(sub_cy - ly) for ly in lines_y])
+                min_dist = min(dist_x, dist_y)
+                diag_len_local = np.sqrt(new_h**2 + process_w**2)
+                item_score = max(0, 100 * (1 - min_dist / (diag_len_local * 0.15)))
+                weighted_score_sum += item_score * area
+                total_area_weight += area
+                cv2.circle(vis_thirds, (sub_cx, sub_cy), 5, (0, 0, 255), -1)
+                if dist_x < dist_y:
+                    nearest_x = lines_x[0] if abs(sub_cx - lines_x[0]) < abs(sub_cx - lines_x[1]) else lines_x[1]
+                    cv2.line(vis_thirds, (sub_cx, sub_cy), (int(nearest_x), sub_cy), (0, 255, 0), 2)
+                else:
+                    nearest_y = lines_y[0] if abs(sub_cy - lines_y[0]) < abs(sub_cy - lines_y[1]) else lines_y[1]
+                    cv2.line(vis_thirds, (sub_cx, sub_cy), (sub_cx, int(nearest_y)), (0, 255, 0), 2)
+            if total_area_weight > 0:
+                score_thirds = weighted_score_sum / total_area_weight
+            else:
+                score_thirds = 0.0
 
             # A3. 平衡
             center_x = process_w // 2
