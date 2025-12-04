@@ -563,3 +563,78 @@ class AestheticDiagnostician:
             "cons": cons,
             "suggestions": suggestions
         }
+
+class BenchmarkManager:
+    def __init__(self, metrics_keys: Optional[List[str]] = None):
+        if metrics_keys is None:
+            metrics_keys = [
+                "composition_diagonal",
+                "composition_thirds",
+                "composition_balance",
+                "composition_symmetry",
+                "color_warmth",
+                "color_saturation",
+                "color_brightness",
+                "color_contrast",
+                "color_clarity",
+                "fg_area_diff",
+                "fg_color_diff",
+                "fg_texture_diff",
+                "fg_text_legibility",
+            ]
+        self.metrics_keys = metrics_keys
+
+    def create_profile(self, reports: List[OmniReport]) -> Dict:
+        profile: Dict[str, Dict[str, float]] = {}
+        if not reports:
+            return profile
+        for key in self.metrics_keys:
+            vals = []
+            for r in reports:
+                v = getattr(r, key, None)
+                if v is not None:
+                    vals.append(float(v))
+            if not vals:
+                continue
+            mean = float(np.mean(vals))
+            std = float(np.std(vals))
+            if key in ["color_warmth", "color_saturation", "color_brightness", "color_clarity", "fg_area_diff", "fg_texture_diff"]:
+                sigma = std if std > 1e-6 else 0.05
+            elif key == "color_contrast":
+                sigma = std if std > 1e-6 else 0.05
+            elif key == "fg_color_diff":
+                sigma = std if std > 1e-6 else 20.0
+            else:
+                sigma = std if std > 1e-6 else 10.0
+            profile[key] = {"mean": mean, "sigma": sigma}
+        return profile
+
+    def score_against_benchmark(self, data: OmniReport, profile: Dict[str, Dict[str, float]]) -> Dict:
+        details: Dict[str, Dict[str, float]] = {}
+        scores = []
+        for key in self.metrics_keys:
+            p = profile.get(key)
+            v = getattr(data, key, None)
+            if p is None or v is None:
+                continue
+            target = float(p["mean"]) 
+            sigma = float(p["sigma"]) if float(p["sigma"]) > 1e-6 else 1.0
+            x = float(v)
+            sim = float(np.exp(-((x - target) ** 2) / (2.0 * (sigma ** 2))))
+            score = int(sim * 100.0)
+            scores.append(sim)
+            details[key] = {
+                "score": score,
+                "target": target,
+                "actual": x,
+            }
+        total_score = int(100.0 * (np.mean(scores) if scores else 0.0))
+        if total_score >= 85:
+            rating = "S (大师级)"
+        elif total_score >= 70:
+            rating = "A (优秀)"
+        elif total_score >= 60:
+            rating = "B (合格)"
+        else:
+            rating = "C (需改进)"
+        return {"total_score": total_score, "rating_level": rating, "details": details}
