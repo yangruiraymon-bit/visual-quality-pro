@@ -468,30 +468,54 @@ class AestheticDiagnostician:
     @staticmethod
     def generate_report(data: OmniReport, config: Dict = None) -> dict:
         if config is None: config = {}
-        
-        # 权重读取
-        w_comp = config.get('weight_composition', 0.3)
-        w_color = config.get('weight_color', 0.3)
-        w_fg = config.get('weight_figure_ground', 0.4)
-        
-        # 构图分
-        comp_score = (data.composition_diagonal + data.composition_thirds + 
-                      data.composition_balance + data.composition_symmetry) / 4
-        
-        color_score = (data.color_clarity * 100 * 0.4 + 
-                       data.color_saturation * 100 * 0.3 + 
-                       data.color_contrast * 100 * 0.3)
-        
-        # 图底分
-        if data.fg_text_present:
-            fg_score = data.fg_text_legibility * 0.6 + min(100, data.fg_color_diff) * 0.4
-        else:
-            fg_score = min(100, data.fg_color_diff) * 0.6 + data.fg_area_diff * 100 * 0.4
-            
-        if data.color_clarity > 0.85:
-            color_score = color_score * 0.6
+        # 细粒度权重（默认值为合理偏好）
+        w_c_diag = float(config.get('w_comp_diagonal', 1.0))
+        w_c_third = float(config.get('w_comp_thirds', 1.0))
+        w_c_bal = float(config.get('w_comp_balance', 1.0))
+        w_c_sym = float(config.get('w_comp_symmetry', 1.0))
+        w_l_warm = float(config.get('w_color_warmth', 0.0))
+        w_l_sat = float(config.get('w_color_saturation', 0.5))
+        w_l_bri = float(config.get('w_color_brightness', 0.0))
+        w_l_cont = float(config.get('w_color_contrast', 0.5))
+        w_l_clar = float(config.get('w_color_clarity', 1.5))
+        w_f_area = float(config.get('w_fg_area', 1.0))
+        w_f_color = float(config.get('w_fg_color', 1.0))
+        w_f_tex = float(config.get('w_fg_texture', 0.5))
+        w_f_text = float(config.get('w_fg_text', 2.0))
 
-        total_score = int(w_comp * comp_score + w_color * color_score + w_fg * fg_score)
+        # 统一映射到 0-100
+        s_c_diag = float(data.composition_diagonal)
+        s_c_third = float(data.composition_thirds)
+        s_c_bal = float(data.composition_balance)
+        s_c_sym = float(getattr(data, 'composition_symmetry', 0.0))
+        s_l_warm = float(data.color_warmth) * 100.0
+        s_l_sat = float(data.color_saturation) * 100.0
+        s_l_bri = max(0.0, 100.0 - abs(float(data.color_brightness) - 0.5) * 200.0)
+        s_l_cont = float(min(100.0, (float(data.color_contrast) / 0.25) * 100.0))
+        val_clar = float(data.color_clarity)
+        if val_clar > 0.5:
+            s_l_clar = max(0.0, 100.0 - (val_clar - 0.5) * 200.0)
+        else:
+            s_l_clar = min(100.0, (val_clar / 0.2) * 100.0)
+        s_f_area = float(data.fg_area_diff) * 100.0
+        s_f_color = float(min(100.0, float(data.fg_color_diff)))
+        s_f_tex = float(np.sqrt(max(0.0, float(data.fg_texture_diff)))) * 100.0
+        has_text = bool(getattr(data, 'fg_text_present', False))
+        s_f_text = float(getattr(data, 'fg_text_legibility', 0.0)) if has_text else 0.0
+        if not has_text:
+            w_f_text = 0.0
+
+        numerator = (
+            s_c_diag * w_c_diag + s_c_third * w_c_third + s_c_bal * w_c_bal + s_c_sym * w_c_sym +
+            s_l_warm * w_l_warm + s_l_sat * w_l_sat + s_l_bri * w_l_bri + s_l_cont * w_l_cont + s_l_clar * w_l_clar +
+            s_f_area * w_f_area + s_f_color * w_f_color + s_f_tex * w_f_tex + s_f_text * w_f_text
+        )
+        denominator = (
+            w_c_diag + w_c_third + w_c_bal + w_c_sym +
+            w_l_warm + w_l_sat + w_l_bri + w_l_cont + w_l_clar +
+            w_f_area + w_f_color + w_f_tex + w_f_text
+        )
+        total_score = int(numerator / denominator) if denominator > 0 else 0
 
         # 评级
         if total_score >= 85: rating = "S (大师级)"
