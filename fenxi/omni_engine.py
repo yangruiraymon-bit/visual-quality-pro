@@ -235,6 +235,19 @@ class OmniVisualEngine:
             txt_mask_dilated = cv2.dilate(txt_mask_temp, kernel, iterations=1)
             text_group_contours, _ = cv2.findContours(txt_mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        face_points = []
+        if getattr(self, 'pose_model', None):
+            try:
+                pose_results = self.pose_model(img_small, verbose=False)
+                if pose_results and pose_results[0].keypoints is not None:
+                    kpts = pose_results[0].keypoints.data.cpu().numpy()
+                    for person_kpts in kpts:
+                        nose = person_kpts[0]
+                        if nose[2] > 0.5:
+                            face_points.append((int(nose[0]), int(nose[1])))
+            except Exception as e:
+                print(f"Pose infer failed: {e}")
+
         # --- 2. AI 主体分割 ---
         binary_mask = self.segmenter.extract_mask(img_small, config, text_boxes=text_boxes_for_seg)
         binary_mask_inv = cv2.bitwise_not(binary_mask)
@@ -290,7 +303,15 @@ class OmniVisualEngine:
                         is_text_area = True
                         break
                 if not is_text_area:
-                    visual_elements.append({"type": "graphic", "centroid": (cx_g, cy_g), "area": area, "color": (0, 0, 255)})
+                    final_cx, final_cy = cx_g, cy_g
+                    is_face = False
+                    for fx, fy in face_points:
+                        dist = cv2.pointPolygonTest(cnt, (fx, fy), True)
+                        if dist > -20:
+                            final_cx, final_cy = fx, fy
+                            is_face = True
+                            break
+                    visual_elements.append({"type": "graphic", "centroid": (final_cx, final_cy), "area": area, "color": (255, 0, 255) if is_face else (0, 0, 255), "is_face": is_face})
             for t_cnt in text_group_contours:
                 area_t = cv2.contourArea(t_cnt)
                 if area_t < (new_h * process_w * 0.005):
@@ -300,7 +321,7 @@ class OmniVisualEngine:
                     continue
                 cx_t = int(M_txt["m10"] / M_txt["m00"])
                 cy_t = int(M_txt["m01"] / M_txt["m00"])
-                visual_elements.append({"type": "text", "centroid": (cx_t, cy_t), "area": area_t * 2.5, "color": (0, 165, 255)})
+                visual_elements.append({"type": "text", "centroid": (cx_t, cy_t), "area": area_t * 2.5, "color": (0, 165, 255), "is_face": False})
                 cv2.drawContours(vis_thirds, [t_cnt], -1, (0, 165, 255), 1)
             total_weight = 0.0
             weighted_score_sum = 0.0
@@ -311,8 +332,9 @@ class OmniVisualEngine:
                 dist_y = min([abs(cy_i - ly) for ly in lines_y])
                 min_dist = min(dist_x, dist_y)
                 item_score = max(0.0, 100.0 * (1.0 - (min_dist / (diag_len_local * 0.15))))
-                weighted_score_sum += item_score * area_w
-                total_weight += area_w
+                weight = area_w * (2.0 if item.get("is_face") else 1.0)
+                weighted_score_sum += item_score * weight
+                total_weight += weight
                 cv2.circle(vis_thirds, (cx_i, cy_i), 5, item["color"], -1)
                 if item_score > 50.0:
                     if dist_x < dist_y:
