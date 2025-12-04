@@ -251,7 +251,6 @@ class OmniVisualEngine:
             cv2.circle(vis_diag, (cx, cy), 6, (0, 0, 255), -1)
             cv2.putText(vis_diag, f"Diag: {int(score_diag)}", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # === [升级版] A2. 三分法 (多主体判定) ===
             w3, h3 = int(process_w/3), int(new_h/3)
             grid_color = (0, 255, 255)
             cv2.line(vis_thirds, (w3, 0), (w3, new_h), grid_color, 1)
@@ -260,9 +259,9 @@ class OmniVisualEngine:
             cv2.line(vis_thirds, (0, 2*h3), (process_w, 2*h3), grid_color, 1)
             lines_x = [w3, 2*w3]
             lines_y = [h3, 2*h3]
+            diag_len_local = np.sqrt(new_h**2 + process_w**2)
+            visual_elements = []
             sub_contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            total_area_weight = 0
-            weighted_score_sum = 0
             for cnt in sub_contours:
                 area = cv2.contourArea(cnt)
                 if area < (new_h * process_w * 0.005):
@@ -270,26 +269,42 @@ class OmniVisualEngine:
                 M_sub = cv2.moments(cnt)
                 if M_sub["m00"] == 0:
                     continue
-                sub_cx = int(M_sub["m10"] / M_sub["m00"])
-                sub_cy = int(M_sub["m01"] / M_sub["m00"])
-                dist_x = min([abs(sub_cx - lx) for lx in lines_x])
-                dist_y = min([abs(sub_cy - ly) for ly in lines_y])
+                cx_g = int(M_sub["m10"] / M_sub["m00"])
+                cy_g = int(M_sub["m01"] / M_sub["m00"])
+                visual_elements.append({"type": "graphic", "centroid": (cx_g, cy_g), "area": area, "color": (0, 0, 255)})
+            for (bbox, text, prob) in ocr_raw:
+                if float(prob) < 0.3:
+                    continue
+                pts = np.array(bbox, dtype=np.int32)
+                M_txt = cv2.moments(pts)
+                if M_txt["m00"] == 0:
+                    continue
+                cx_t = int(M_txt["m10"] / M_txt["m00"])
+                cy_t = int(M_txt["m01"] / M_txt["m00"])
+                area_t = cv2.contourArea(pts)
+                if area_t < (new_h * process_w * 0.002):
+                    continue
+                visual_elements.append({"type": "text", "centroid": (cx_t, cy_t), "area": area_t * 2.0, "color": (0, 165, 255)})
+            total_weight = 0.0
+            weighted_score_sum = 0.0
+            for item in visual_elements:
+                cx_i, cy_i = item["centroid"]
+                area_w = float(item["area"])
+                dist_x = min([abs(cx_i - lx) for lx in lines_x])
+                dist_y = min([abs(cy_i - ly) for ly in lines_y])
                 min_dist = min(dist_x, dist_y)
-                diag_len_local = np.sqrt(new_h**2 + process_w**2)
-                item_score = max(0, 100 * (1 - min_dist / (diag_len_local * 0.15)))
-                weighted_score_sum += item_score * area
-                total_area_weight += area
-                cv2.circle(vis_thirds, (sub_cx, sub_cy), 5, (0, 0, 255), -1)
-                if dist_x < dist_y:
-                    nearest_x = lines_x[0] if abs(sub_cx - lines_x[0]) < abs(sub_cx - lines_x[1]) else lines_x[1]
-                    cv2.line(vis_thirds, (sub_cx, sub_cy), (int(nearest_x), sub_cy), (0, 255, 0), 2)
-                else:
-                    nearest_y = lines_y[0] if abs(sub_cy - lines_y[0]) < abs(sub_cy - lines_y[1]) else lines_y[1]
-                    cv2.line(vis_thirds, (sub_cx, sub_cy), (sub_cx, int(nearest_y)), (0, 255, 0), 2)
-            if total_area_weight > 0:
-                score_thirds = weighted_score_sum / total_area_weight
-            else:
-                score_thirds = 0.0
+                item_score = max(0.0, 100.0 * (1.0 - (min_dist / (diag_len_local * 0.15))))
+                weighted_score_sum += item_score * area_w
+                total_weight += area_w
+                cv2.circle(vis_thirds, (cx_i, cy_i), 5, item["color"], -1)
+                if item_score > 50.0:
+                    if dist_x < dist_y:
+                        nx = lines_x[0] if abs(cx_i - lines_x[0]) < abs(cx_i - lines_x[1]) else lines_x[1]
+                        cv2.line(vis_thirds, (cx_i, cy_i), (int(nx), cy_i), (0, 255, 0), 2)
+                    else:
+                        ny = lines_y[0] if abs(cy_i - lines_y[0]) < abs(cy_i - lines_y[1]) else lines_y[1]
+                        cv2.line(vis_thirds, (cx_i, cy_i), (cx_i, int(ny)), (0, 255, 0), 2)
+            score_thirds = (weighted_score_sum / total_weight) if total_weight > 0 else 0.0
 
             # A3. 平衡
             center_x = process_w // 2
