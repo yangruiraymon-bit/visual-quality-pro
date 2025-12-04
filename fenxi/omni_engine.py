@@ -61,105 +61,96 @@ class HybridSegmenter:
             print(f"YOLO load failed: {e}")
             self.semantic_model = None
 
-    def _get_kmeans_candidates(self, img: np.ndarray, k: int = 5):
+    def _get_background_mask(self, img: np.ndarray, k: int = 3) -> np.ndarray:
         h, w = img.shape[:2]
-        try:
-            blurred = cv2.pyrMeanShiftFiltering(img, 15, 30)
-        except:
-            blurred = cv2.GaussianBlur(img, (11, 11), 0)
-            
-        pixel_values = blurred.reshape((-1, 3)).astype(np.float32)
+        scale = 0.5
+        small_h, small_w = int(h * scale), int(w * scale)
+        small_img = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        data = small_img.reshape((-1, 3)).astype(np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        _, labels, _ = cv2.kmeans(pixel_values, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-        labels = labels.reshape((h, w))
-        
-        candidates = []
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        _, labels, centers = cv2.kmeans(data, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        labels = labels.flatten()
+        counts = np.bincount(labels)
+        bg_label = np.argmax(counts)
+        fg_mask_small = (labels != bg_label).astype(np.uint8) * 255
+        fg_mask_small = fg_mask_small.reshape((small_h, small_w))
+        fg_mask = cv2.resize(fg_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+        return fg_mask
 
-        for i in range(k):
-            mask = (labels == i).astype(np.uint8) * 255
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            
-            num, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-            for j in range(1, num):
-                area = stats[j, cv2.CC_STAT_AREA]
-                if area < (h * w * 0.02): continue
-                
-                comp_mask = (labels_im == j).astype(np.uint8) * 255
-                cx, cy = centroids[j]
-                dist_to_center = np.sqrt(((cx - w/2)/w)**2 + ((cy - h/2)/h)**2)
-                
-                touches_border = (np.any(comp_mask[0, :]) or np.any(comp_mask[-1, :]) or 
-                                  np.any(comp_mask[:, 0]) or np.any(comp_mask[:, -1]))
-                
-                candidates.append({
-                    "mask": comp_mask, 
-                    "area": area, 
-                    "border": touches_border,
-                    "dist": dist_to_center
-                })
-        return candidates
-
-    def extract_mask(self, image_bgr: np.ndarray, config: Dict, text_boxes: List = None) -> np.ndarray:
-        h, w = image_bgr.shape[:2]
-        kmeans_k = config.get('seg_kmeans_k', 5)
-
-        # 1. 色块候选
-        color_candidates = self._get_kmeans_candidates(image_bgr, k=kmeans_k)
-        if not color_candidates:
-            return np.zeros((h, w), dtype=np.uint8)
-
-        # 2. 语义对象候选
-        semantic_masks = []
-        
-        # A. YOLO
+    def _get_yolo_masks(self, img: np.ndarray) -> List[np.ndarray]:
+        masks = []
         if self.semantic_model:
-            results = self.semantic_model(image_bgr, verbose=False, retina_masks=True)
+            results = self.semantic_model(img, verbose=False, retina_masks=True)
             if results[0].masks:
+                h, w = img.shape[:2]
                 for mask_tensor in results[0].masks.data:
                     m = mask_tensor.cpu().numpy()
-                    if m.shape != (h, w):
-                        m = cv2.resize(m, (w, h))
+                    if m.shape != (h, w): m = cv2.resize(m, (w, h))
                     bin_m = (m > 0.5).astype(np.uint8) * 255
-                    semantic_masks.append(bin_m)
-        
-        # B. 文字区域 (作为强语义对象)
+                    masks.append(bin_m)
+        return masks
+
+    def extract_all_elements_mask(self, image_bgr: np.ndarray, config: Dict, text_boxes: List = None) -> np.ndarray:
+        h, w = image_bgr.shape[:2]
+        base_mask = self._get_background_mask(image_bgr, k=3)
+        text_mask = np.zeros((h, w), dtype=np.uint8)
         if text_boxes:
             for box in text_boxes:
                 pts = np.array(box, dtype=np.int32)
-                rect_area = cv2.contourArea(pts)
-                if rect_area > (h * w * 0.015): # 仅考虑大标题
-                    txt_mask = np.zeros((h, w), dtype=np.uint8)
-                    cv2.fillPoly(txt_mask, [pts], 255)
-                    semantic_masks.append(txt_mask)
+                cv2.fillPoly(text_mask, [pts], 255)
+        yolo_mask = np.zeros((h, w), dtype=np.uint8)
+        yolo_results = self._get_yolo_masks(image_bgr)
+        for m in yolo_results:
+            yolo_mask = cv2.bitwise_or(yolo_mask, m)
+        combined_mask = cv2.bitwise_or(base_mask, text_mask)
+        combined_mask = cv2.bitwise_or(combined_mask, yolo_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return combined_mask
 
-        # 3. 融合
-        final_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        if semantic_masks:
-            for sem_mask in semantic_masks:
-                final_mask = cv2.bitwise_or(final_mask, sem_mask)
-            return final_mask
-        else:
-            # Fallback
-            best_score = -1
-            best_candidate = None
-            for c in color_candidates:
-                area_ratio = c['area'] / (h * w)
-                if area_ratio > 0.9: continue
-                border_penalty = 0.3 if c['border'] else 1.0
-                center_bonus = 1.0 - c['dist']
-                score = area_ratio * border_penalty * center_bonus
-                if score > best_score:
-                    best_score = score
-                    best_candidate = c['mask']
-            
-            if best_candidate is not None:
-                return best_candidate
-            else:
-                color_candidates.sort(key=lambda x: x['area'], reverse=True)
-                return color_candidates[0]['mask']
+    def extract_main_subject_mask(self, image_bgr: np.ndarray, config: Dict, text_boxes: List = None) -> np.ndarray:
+        return self._get_background_mask(image_bgr, k=5)
+
+    def _get_kmeans_result(self, img: np.ndarray, k: int = 5) -> (np.ndarray, int):
+        h, w = img.shape[:2]
+        small = cv2.resize(img, (max(1, w//2), max(1, h//2)), interpolation=cv2.INTER_LINEAR)
+        blurred = cv2.GaussianBlur(small, (9, 9), 0)
+        pixels = blurred.reshape((-1, 3)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, _ = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        sh = small.shape[:2]
+        labels = labels.reshape(sh)
+        corner = [labels[0,0], labels[0,-1], labels[-1,0], labels[-1,-1]]
+        bg = max(set(corner), key=corner.count)
+        labels_full = cv2.resize(labels.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        return labels_full, bg
+
+    def _get_yolo_masks(self, img: np.ndarray) -> List[np.ndarray]:
+        masks = []
+        if self.semantic_model:
+            results = self.semantic_model(img, verbose=False, retina_masks=True)
+            if results and results[0].masks:
+                h, w = img.shape[:2]
+                for mask_tensor in results[0].masks.data:
+                    m = mask_tensor.cpu().numpy()
+                    if m.shape != (h, w): m = cv2.resize(m, (w, h))
+                    masks.append(((m > 0.5).astype(np.uint8) * 255))
+        return masks
+
+    def extract_all_elements_mask(self, image_bgr: np.ndarray, config: Dict) -> np.ndarray:
+        h, w = image_bgr.shape[:2]
+        yolo_masks = self._get_yolo_masks(image_bgr)
+        if len(yolo_masks) > 0:
+            combined = np.zeros((h, w), dtype=np.uint8)
+            for m in yolo_masks:
+                combined = cv2.bitwise_or(combined, m)
+            return combined
+        labels, bg_label = self._get_kmeans_result(image_bgr, config.get('seg_kmeans_k', 5))
+        elements = (labels != bg_label).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        elements = cv2.morphologyEx(elements, cv2.MORPH_OPEN, kernel)
+        return elements
 
 # === 全能视觉分析引擎 ===
 class OmniVisualEngine:
@@ -228,8 +219,8 @@ class OmniVisualEngine:
                             face_points.append((int(nose[0]), int(nose[1])))
             except: pass
 
-        # --- 2. AI 主体分割 ---
-        binary_mask = self.segmenter.extract_mask(img_small, config, text_boxes=text_boxes_for_seg)
+        # --- 2. 分割 ---
+        binary_mask = self.segmenter.extract_main_subject_mask(img_small, config, text_boxes_for_seg)
         binary_mask_inv = cv2.bitwise_not(binary_mask)
         
         vis_diag = img_small.copy()
@@ -686,6 +677,14 @@ class BenchmarkManager:
             'fg_text_legibility' 
         ]
 
+    @staticmethod
+    def auto_calculate_tolerance(values: List[float]) -> (float, float):
+        mu = float(np.mean(values))
+        sigma = float(np.std(values))
+        if sigma == 0.0:
+            sigma = (abs(mu) * 0.1) if mu != 0.0 else 0.05
+        return mu, sigma
+
     def create_profile(self, reports: List[OmniReport]) -> Dict:
         profile = {}
         count = len(reports)
@@ -697,13 +696,10 @@ class BenchmarkManager:
                 val = getattr(r, key, 0)
                 if val is None: val = 0
                 values.append(float(val))
-            
-            mu = np.mean(values)
-            sigma = np.std(values)
-            
+            mu, sigma = self.auto_calculate_tolerance(values)
             profile[key] = {
                 'target': mu,
-                'tolerance': max(sigma, 0.05)
+                'tolerance': sigma
             }
             
         return profile
@@ -729,7 +725,13 @@ class BenchmarkManager:
             k = 2.0
             if sigma == 0:
                 sigma = 0.05
-            score = 100 * np.exp(-((actual - target) ** 2) / (2 * (k * sigma) ** 2))
+            if key in ['color_clarity', 'fg_text_legibility', 'fg_color_diff']:
+                if actual > target:
+                    score = 100.0
+                else:
+                    score = 100 * np.exp(-((actual - target) ** 2) / (2 * (sigma) ** 2))
+            else:
+                score = 100 * np.exp(-((actual - target) ** 2) / (2 * (sigma) ** 2))
             scores[key] = score
             total_score += score
             valid_keys += 1

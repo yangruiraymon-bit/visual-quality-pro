@@ -8,644 +8,747 @@ import io
 import zipfile
 import time
 import json
-# 确保 omni_engine.py 在同一目录下
-from omni_engine import OmniVisualEngine, AestheticDiagnostician, BenchmarkManager
 
-# === 1. 页面基础配置 ===
-st.set_page_config(page_title="全能视觉分析 Pro", layout="wide", page_icon="🧿")
+# 尝试导入核心模块
+try:
+    from omni_engine import OmniVisualEngine, AestheticDiagnostician, BenchmarkManager
+    # 导入新拆分的服务模块
+    from benchmark_service import BenchmarkTrainer
+except ImportError as e:
+    st.error(f"❌ 缺少核心模块: {e}。请确保 omni_engine.py 和 benchmark_service.py 在同一目录下。")
+    st.stop()
+
+# ==========================================
+# 1. 页面基础配置
+# ==========================================
+st.set_page_config(page_title="全能视觉分析 Pro (服务架构版)", layout="wide", page_icon="🧿")
 
 st.markdown("""
     <style>
         .block-container { padding-top: 1rem; padding-bottom: 5rem; }
         h1 { font-size: 2.0rem !important; margin-bottom: 0.5rem !important; }
-        section[data-testid="stSidebar"] { background-color: #f8f9fa; }
-        .stButton button { width: 100%; border-radius: 8px; }
+        section[data-testid="stSidebar"] { background-color: #f8f9fa; border-right: 1px solid #ddd; }
+        .stButton button { border-radius: 8px; font-weight: 600; }
+        .stFileUploader { padding: 1.5rem; border: 2px dashed #e0e0e0; border-radius: 12px; background-color: #ffffff; }
+        
+        /* --- 指标卡样式 --- */
+        [data-testid="stMetric"] {
+            background-color: #f8f9fa;
+            padding: 10px 15px;
+            border-radius: 8px;
+            border: 1px solid #eee;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            transition: all 0.2s;
+        }
+        [data-testid="stMetric"]:hover {
+            border-color: #d1d5db;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        }
     </style>
 """, unsafe_allow_html=True)
 
-# === 2. 状态初始化 ===
+# ==========================================
+# 2. 状态管理
+# ==========================================
 if 'batch_df' not in st.session_state: st.session_state.batch_df = None
 if 'batch_zip' not in st.session_state: st.session_state.batch_zip = None
-if 'batch_imgs' not in st.session_state: st.session_state.batch_imgs = [] # 存储用于Excel的图片流字典
+if 'batch_imgs' not in st.session_state: st.session_state.batch_imgs = [] 
 if 'batch_logs' not in st.session_state: st.session_state.batch_logs = []
 if 'processing' not in st.session_state: st.session_state.processing = False
 if 'benchmark_profile' not in st.session_state: st.session_state.benchmark_profile = None
 
-# 初始化引擎
 @st.cache_resource
 def get_engine():
     return OmniVisualEngine()
 
 engine = get_engine()
 
-# === 辅助函数：统一归一化逻辑 (0-100) ===
-def normalize_values(source, is_profile=False):
-    def get_val(key, default=0.0):
-        if is_profile:
-            v = source.get(key, {})
-            return float(v.get('target', v.get('mean', default)))
-        else:
-            return float(getattr(source, key, default))
-    v1 = get_val('composition_diagonal')
-    v2 = get_val('composition_thirds')
-    v3 = get_val('composition_balance')
-    v4 = get_val('composition_symmetry')
-    v5 = get_val('color_warmth') * 100.0
-    v6 = get_val('color_saturation') * 100.0
-    v7 = get_val('color_brightness') * 100.0
-    v8 = min(100.0, (get_val('color_contrast') / 0.3) * 100.0)
-    v9 = get_val('color_clarity') * 100.0
-    v10 = get_val('fg_area_diff') * 100.0
-    v11 = min(100.0, get_val('fg_color_diff'))
-    v12 = get_val('fg_texture_diff') * 100.0
-    if is_profile:
-        v13 = get_val('fg_text_legibility')
-    else:
-        has_text = getattr(source, 'fg_text_present', False)
-        v13 = get_val('fg_text_legibility') if has_text else 0.0
-    return [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13]
+# ==========================================
+# 3. 核心工具函数 (评分逻辑找回)
+# ==========================================
 
-# === 3. Excel 生成函数 (核心升级) ===
-def to_excel_with_all_images(df, img_dicts):
+def make_serializable(obj):
+    if isinstance(obj, (np.integer, np.floating)): return float(obj)
+    if isinstance(obj, np.ndarray): return obj.tolist()
+    return obj
+
+def calculate_dual_score(data, profile, bm_manager):
     """
-    将数据和所有对应的可视化图写入 Excel
-    df: 数据 DataFrame
-    img_dicts: list of dict, 每个元素是 {'diag': bytes, 'thirds': bytes...}
+    核心评分逻辑：支持【单标杆】和【双标杆(正向+负向)】
     """
-    output = io.BytesIO()
+    # 1. 判断是 新版双标杆结构 还是 旧版单标杆结构
+    is_dual = 'positive' in profile and isinstance(profile['positive'], dict)
     
-    # 定义图片列的顺序和标题
-    img_columns = [
-        ('vis_diag', '构图:对角线'),
-        ('vis_thirds', '构图:三分法'),
-        ('vis_balance', '构图:平衡'),
-        ('vis_symmetry_heatmap', '构图:对称热力'),
-        ('vis_warmth', '色彩:暖色分布'),
-        ('vis_saturation', '色彩:饱和度'),
-        ('vis_brightness', '色彩:亮度'),
-        ('vis_contrast', '色彩:对比度'),
-        ('vis_clarity', '色彩:清晰度'),
-        ('vis_mask', '图底:面积Mask'),
-        ('vis_color_contrast', '图底:色彩抽离'),
-        ('vis_edge_composite', '图底:纹理对比'),
-        ('vis_text_analysis', '文字:易读性')
+    if is_dual:
+        # --- 双向评分逻辑 ---
+        # A. 计算正向得分 (Reward)
+        res_pos = bm_manager.score_against_benchmark(data, profile['positive'])
+        score_pos = res_pos['total_score']
+        
+        # B. 计算负向得分 (Penalty) - 仅当存在负向配置时
+        score_neg = 0
+        if 'negative' in profile and profile['negative']:
+            res_neg = bm_manager.score_against_benchmark(data, profile['negative'])
+            score_neg = res_neg['total_score'] # 这里的"分"代表"有多像烂图"
+        
+        # C. 综合计算
+        # 公式：最终分 = 正向分 - (负向分 * 惩罚系数)
+        penalty_factor = 0.4 
+        final_score = score_pos - (score_neg * penalty_factor)
+        final_score = max(0, min(100, final_score)) # 截断在 0-100
+        
+        # 评级逻辑
+        if final_score >= 90: rating = "S (卓越)"
+        elif final_score >= 80: rating = "A (优秀)"
+        elif final_score >= 70: rating = "B (良好)"
+        elif final_score >= 60: rating = "C (合格)"
+        else: rating = "D (不合格)"
+        
+        return {
+            'total_score': final_score,
+            'rating_level': rating,
+            'mode': '双向标杆',
+            'details': res_pos['details'], # 详细维度对比依然用正向的作为基准
+            'score_breakdown': {'pos': score_pos, 'neg': score_neg} # 记录细分
+        }
+    else:
+        # --- 传统单标杆逻辑 (兼容旧版) ---
+        res = bm_manager.score_against_benchmark(data, profile)
+        res['mode'] = '单向标杆'
+        res['score_breakdown'] = None
+        return res
+
+def normalize_values(source, is_profile=False):
+    """雷达图数据归一化"""
+    def get(k): 
+        val = source.get(k, {}).get('target', 0) if is_profile else getattr(source, k, 0)
+        return float(val) if val is not None else 0.0
+    
+    return [
+        get('composition_diagonal'), get('composition_thirds'), get('composition_balance'), get('composition_symmetry'),
+        get('color_warmth')*100, get('color_saturation')*100, get('color_brightness')*100, min(100, (get('color_contrast')/0.3)*100), get('color_clarity')*100,
+        get('fg_area_diff')*100, min(100, get('fg_color_diff')), get('fg_texture_diff')*100,
+        get('fg_text_legibility') if is_profile or getattr(source, 'fg_text_present', False) else 0
     ]
 
+# ==========================================
+# 4. 批量处理逻辑
+# ==========================================
+def to_excel_with_all_images(df, img_dicts):
+    """生成包含 13 个维度诊断图的 Excel 文件"""
+    output = io.BytesIO()
+    img_columns_map = [
+        ('v_diag', '图:对角线'),
+        ('v_thirds', '图:三分法'),
+        ('v_bal', '图:平衡度'),
+        ('v_sym', '图:对称性'),
+        ('v_sat', '图:饱和度'),
+        ('v_bri', '图:亮度'),
+        ('v_warm', '图:暖色调'),
+        ('v_cont', '图:对比度'),
+        ('v_clar', '图:清晰度'),
+        ('v_f_col', '图:主体色差'),
+        ('v_f_area', '图:主体Mask'),
+        ('v_f_tex', '图:纹理对比'),
+        ('v_text', '图:文字分析')
+    ]
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name='分析结果', index=False)
-        
         workbook = writer.book
         worksheet = writer.sheets['分析结果']
-        
-        # 基础样式
-        header_fmt = workbook.add_format({'bold': True, 'border': 1, 'align': 'center', 'valign': 'vcenter', 'bg_color': '#DDEBF7'})
-        base_col_count = len(df.columns)
-        
-        # 设置行高 (适应图片高度 100px -> 约75磅)
-        worksheet.set_default_row(75)
-        
-        # 写入图片列的表头
-        for i, (key, title) in enumerate(img_columns):
-            col_idx = base_col_count + i
-            worksheet.write(0, col_idx, title, header_fmt)
-            worksheet.set_column(col_idx, col_idx, 18) # 设置列宽
-            
-        # 遍历每一行数据
+        header_fmt = workbook.add_format({'bold': True, 'border': 1, 'bg_color': '#DDEBF7', 'valign': 'vcenter', 'align': 'center'})
+        base_col = len(df.columns)
+        worksheet.set_default_row(80)
+        for i, (_, title) in enumerate(img_columns_map):
+            worksheet.write(0, base_col + i, title, header_fmt)
+            worksheet.set_column(base_col + i, base_col + i, 18)
         for row_idx, img_dict in enumerate(img_dicts):
-            # Excel 行索引从 1 开始 (0是表头)
+            if not img_dict:
+                continue
             excel_row = row_idx + 1
-            
-            if img_dict is None: continue
-            
-            for i, (key, title) in enumerate(img_columns):
-                img_data = img_dict.get(key)
-                if img_data:
-                    col_idx = base_col_count + i
-                    # 插入图片
-                    worksheet.insert_image(excel_row, col_idx, f"{key}.png", {
-                        'image_data': img_data,
-                        'x_scale': 1, 'y_scale': 1, # 图片已经在预处理时缩放好了
-                        'object_position': 1 # 居中
-                    })
-                    
+            for i, (key, _) in enumerate(img_columns_map):
+                img_raw_bytes = img_dict.get(key)
+                if img_raw_bytes:
+                    image_stream = io.BytesIO(img_raw_bytes)
+                    unique_filename = f"r{row_idx}_{key}.png"
+                    try:
+                        worksheet.insert_image(
+                            excel_row, base_col + i,
+                            unique_filename,
+                            {
+                                'image_data': image_stream,
+                                'x_scale': 0.12, 'y_scale': 0.12,
+                                'object_position': 1
+                            }
+                        )
+                    except:
+                        pass
     return output.getvalue()
 
-# === 4. 批量处理逻辑 (Callback) ===
-def run_batch_process(files, cfg, need_csv, need_zip):
+def run_batch_process(files, cfg, need_zip, profile=None):
     st.session_state.processing = True
     st.session_state.batch_logs = []
-    
+    ALL_DIMS_MAPPING = [
+        ('composition_diagonal', '构图_对角线'), ('composition_thirds', '构图_三分法'),
+        ('composition_balance', '构图_平衡度'), ('composition_symmetry', '构图_对称性'),
+        ('color_saturation', '色彩_饱和度'), ('color_brightness', '色彩_亮度'),
+        ('color_warmth', '色彩_暖色调'), ('color_contrast', '色彩_对比度'),
+        ('color_clarity', '色彩_清晰度'),
+        ('fg_color_diff', '图底_色差'), ('fg_area_diff', '图底_占比'),
+        ('fg_texture_diff', '图底_纹理差'), ('fg_text_legibility', '文字_易读性')
+    ]
     rows = []
-    img_dicts_list = [] # 用于存储 Excel 图片流
-    
+    diff_rows = []
+    raw_json_list = []
+    img_dicts = []
     zip_buffer = io.BytesIO() if need_zip else None
     zf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) if need_zip else None
-    
+    bm_manager = BenchmarkManager() if profile else None
     total = len(files)
     progress_bar = st.progress(0)
-    
     for idx, f in enumerate(files):
-        log_msg = f"[{idx+1}/{total}] 处理中: {f.name}..."
-        st.session_state.batch_logs.append(log_msg)
-        
         try:
+            f.seek(0)
             f_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
             img_bgr = cv2.imdecode(f_bytes, cv2.IMREAD_COLOR)
-            
             if img_bgr is None:
-                st.session_state.batch_logs.append(f"❌ 错误: 无法读取 {f.name}")
-                rows.append({"文件名": f.name, "总分": 0, "评级": "Error"})
-                img_dicts_list.append(None)
+                rows.append({"文件名": f.name, "综合得分": 0, "评级": "读取失败"})
+                diff_rows.append({"文件名": f.name})
+                img_dicts.append({})
                 continue
-
-            # 分析
             d = engine.analyze(img_bgr, config=cfg)
-            rep = AestheticDiagnostician.generate_report(d, config=cfg)
-            
-            # 数据行
-            probs = []
-            if d.color_clarity < 0.1: probs.append("雾感重")
-            if d.fg_color_diff < 40: probs.append("主体不清")
-            if getattr(d,'fg_text_present',False) and d.fg_text_legibility < 60: probs.append("文字难辨")
-            
-            row = {
-                "文件名": f.name,
-                "总分": rep['total_score'],
-                "评级": rep['rating_level'],
-                "风格": " ".join(rep['style_tags']),
-                "问题摘要": "、".join(probs) if probs else "无",
-                "构图_对角线": d.composition_diagonal,
-                "构图_三分法": d.composition_thirds,
-                "构图_平衡度": d.composition_balance,
-                "构图_对称性": getattr(d, 'composition_symmetry', 0),
-                "色彩_暖色占比": d.color_warmth,
-                "色彩_饱和度": d.color_saturation,
-                "色彩_亮度": d.color_brightness,
-                "色彩_对比度": d.color_contrast,
-                "色彩_清晰度": d.color_clarity,
-                "图底_面积差": d.fg_area_diff,
-                "图底_色差": d.fg_color_diff,
-                "图底_纹理差": d.fg_texture_diff,
-                "文字_是否存在": getattr(d, 'fg_text_present', False),
-                "文字_易读性": getattr(d, 'fg_text_legibility', 0),
-                "文字_对比度": getattr(d, 'fg_text_contrast', 0)
+            if profile:
+                if 'positive' in profile:
+                    try:
+                        from app import calculate_dual_score
+                        res = calculate_dual_score(d, profile, bm_manager)
+                    except:
+                        res = bm_manager.score_against_benchmark(d, profile['positive'])
+                        res['mode'] = '标杆(降级)'
+                    target_dict = profile['positive']
+                else:
+                    res = bm_manager.score_against_benchmark(d, profile)
+                    target_dict = profile
+                final_score = res['total_score']
+                final_rating = res['rating_level']
+                mode_str = f"标杆 ({res.get('mode','默认')})"
+            else:
+                rep = AestheticDiagnostician.generate_report(d, config=cfg)
+                final_score = rep['total_score']
+                final_rating = rep['rating_level']
+                mode_str = "通用模式"
+                target_dict = {}
+            base_info = {"文件名": f.name, "综合得分": final_score, "评级": final_rating, "模式": mode_str}
+            row_data = base_info.copy()
+            diff_data = base_info.copy()
+            for key, label in ALL_DIMS_MAPPING:
+                val = getattr(d, key, 0) or 0
+                if key == 'fg_text_legibility' and not getattr(d, 'fg_text_present', False): val = 0
+                row_data[label] = round(val, 2)
+                if profile and key in target_dict:
+                    t_val = target_dict[key].get('target', 0)
+                    diff_data[f"Δ_{label}"] = round(val - t_val, 2)
+                else:
+                    diff_data[f"Δ_{label}"] = 0
+            rows.append(row_data)
+            diff_rows.append(diff_data)
+            raw_obj = {k: getattr(d, k) for k, _ in ALL_DIMS_MAPPING}
+            raw_obj['filename'] = f.name
+            raw_json_list.append(raw_obj)
+            curr_imgs = {}
+            vis_map = {
+                'v_diag': 'vis_diag',
+                'v_thirds': 'vis_thirds',
+                'v_bal': 'vis_balance',
+                'v_sym': 'vis_symmetry_heatmap',
+                'v_sat': 'vis_saturation',
+                'v_bri': 'vis_brightness',
+                'v_warm': 'vis_warmth',
+                'v_cont': 'vis_contrast',
+                'v_clar': 'vis_clarity',
+                'v_f_col': 'vis_color_contrast',
+                'v_f_area': 'vis_mask',
+                'v_f_tex': 'vis_edge_composite',
+                'v_text': 'vis_text_analysis'
             }
-            rows.append(row)
-            
-            # === 处理图片 ===
-            # 1. 准备 Excel 用的缩略图 (存入内存)
-            # 2. 准备 ZIP 用的原图 (写入 ZIP)
-            
-            current_imgs = {} # 存放当前行的所有缩略图流
-            
-            # 需要保存的所有字段名
-            keys = [
-                'vis_diag', 'vis_thirds', 'vis_balance', 'vis_symmetry_heatmap',
-                'vis_warmth', 'vis_saturation', 'vis_brightness', 'vis_contrast', 'vis_clarity',
-                'vis_mask', 'vis_color_contrast', 'vis_edge_composite', 'vis_text_analysis'
-            ]
-            
-            base_name = f.name.rsplit('.', 1)[0]
-            
-            for key in keys:
-                img_arr = getattr(d, key, None)
-                if img_arr is not None:
-                    # 统一转 PIL RGB
-                    if len(img_arr.shape)==3 and img_arr.shape[2]==3: 
-                        pil_img = Image.fromarray(img_arr)
-                    else:
-                        pil_img = Image.fromarray(img_arr)
-                    
-                    # A. 为 Excel 制作缩略图 (高度固定 100px)
-                    # 保持比例缩放
-                    w_orig, h_orig = pil_img.size
-                    ratio = 100.0 / h_orig
-                    new_w = int(w_orig * ratio)
-                    thumb = pil_img.resize((new_w, 100))
-                    
-                    b_thumb = io.BytesIO()
-                    thumb.save(b_thumb, format='PNG')
-                    current_imgs[key] = b_thumb
-                    
-                    # B. 为 ZIP 保存高清图
-                    if need_zip and zf:
-                        b_full = io.BytesIO()
-                        pil_img.save(b_full, format='JPEG', quality=85)
-                        zf.writestr(f"diagnostics/{base_name}_{key}.jpg", b_full.getvalue())
-            
-            img_dicts_list.append(current_imgs)
-
+            for excel_key, attr_name in vis_map.items():
+                img_data = getattr(d, attr_name, None)
+                if img_data is not None:
+                    b = io.BytesIO()
+                    if hasattr(img_data, 'dtype') and img_data.dtype != np.uint8:
+                        img_data = img_data.astype(np.uint8)
+                    Image.fromarray(img_data).save(b, 'PNG')
+                    curr_imgs[excel_key] = b.getvalue()
+            img_dicts.append(curr_imgs)
+            if zf:
+                base_name = f.name.rsplit('.', 1)[0]
+                for excel_key, img_bytes in curr_imgs.items():
+                    zf.writestr(f"diagnostics/{base_name}_{excel_key}.png", img_bytes)
         except Exception as e:
-            st.session_state.batch_logs.append(f"❌ 异常: {f.name} - {str(e)}")
-            rows.append({"文件名": f.name, "总分": 0, "评级": "Error", "问题摘要": str(e)})
-            img_dicts_list.append(None)
-        
+            st.session_state.batch_logs.append(f"Error {f.name}: {e}")
+            img_dicts.append({})
         progress_bar.progress((idx + 1) / total)
-
     if zf: zf.close()
-    
-    # 更新 Session State
     st.session_state.batch_df = pd.DataFrame(rows)
-    st.session_state.batch_imgs = img_dicts_list # 保存图片流列表
+    st.session_state.batch_diff_df = pd.DataFrame(diff_rows)
+    st.session_state.batch_raw_json = raw_json_list
+    st.session_state.batch_imgs = img_dicts
     st.session_state.batch_zip = zip_buffer.getvalue() if need_zip else None
     st.session_state.processing = False
-    st.session_state.batch_logs.append("✅ 所有任务处理完成！")
-
 
 # ==========================================
-# 🟢 侧边栏布局
+# 5. 侧边栏布局 (修复重复ID版)
 # ==========================================
 with st.sidebar:
-    st.header("🧿 视觉分析控制台")
-    mode = st.radio("工作模式", ["🏆 建立标杆", "📸 单图诊断", "📦 批量工厂"], index=1)
+    st.header("🧿 视觉分析 Pro")
+    mode = st.radio(
+        "工作模式",
+        ["📸 单图诊断", "📦 批量工厂", "🏆 建立标杆"],
+        index=0,
+        key="nav_mode_selection"
+    )
     st.divider()
-    if st.session_state.benchmark_profile:
-        st.success("✅ 已加载行业标杆配置")
-        if st.button("清除标杆"):
-            st.session_state.benchmark_profile = None
-            st.rerun()
-    else:
-        st.info("ℹ️ 当前使用通用评分标准")
     
-    with st.expander("⚙️ 算法参数配置", expanded=False):
-        p_width = st.slider("分析分辨率", 256, 1024, 512, 128)
-        k_num = st.slider("聚类数", 2, 8, 5)
-        st.caption("构图"); t_diag = st.slider("对角线容差", 0.1, 0.5, 0.3)
+    current_profile = st.session_state.benchmark_profile
+    if current_profile:
+        if 'positive' in current_profile:
+            st.success("✅ 双向标杆：已激活")
+        else:
+            st.success("✅ 单向标杆：已激活")
+        if st.button("清除标杆", use_container_width=True):
+            st.session_state.benchmark_profile = None; st.rerun()
+    
+    with st.expander("⚙️ 基础算法参数", expanded=False):
+        p_width = st.slider("处理分辨率", 256, 1024, 512, 128, help="越高性能消耗越大")
+        k_num = st.slider("色彩聚类数", 2, 8, 5)
+        st.caption("阈值微调")
+        t_diag = st.slider("对角线判定", 0.1, 0.5, 0.3)
         t_sym_blur = st.slider("对称模糊K", 1, 51, 31, 2)
-        st.caption("图底"); ref_tex = st.slider("纹理基准", 10.0, 100.0, 50.0)
-    with st.expander("⚖️ 评分权重定制 (0=不计分)", expanded=False):
-        st.caption("📐 构图维度")
-        wc1 = st.slider("对角线", 0.0, 5.0, 1.0, 0.1, key="w_c1")
-        wc2 = st.slider("三分法", 0.0, 5.0, 1.0, 0.1, key="w_c2")
-        wc3 = st.slider("平衡度", 0.0, 5.0, 1.0, 0.1, key="w_c3")
-        wc4 = st.slider("稳定性", 0.0, 5.0, 1.0, 0.1, key="w_c4")
-        st.caption("🎨 色彩维度")
-        wl1 = st.slider("清晰度", 0.0, 5.0, 2.0, 0.1, key="w_l1")
-        wl2 = st.slider("对比度", 0.0, 5.0, 1.0, 0.1, key="w_l2")
-        wl3 = st.slider("饱和度", 0.0, 5.0, 1.0, 0.1, key="w_l3")
-        wl4 = st.slider("暖色调", 0.0, 5.0, 0.5, 0.1, key="w_l4", help="商业/美食摄影建议调高此权重 (暖色=高分)")
-        wl5 = st.slider("亮度", 0.0, 5.0, 0.5, 0.1, key="w_l5", help="商业/美食摄影建议调高 (0.45-0.75区间得满分)")
-        st.caption("🌗 图底维度")
-        wf1 = st.slider("主体色差", 0.0, 5.0, 1.5, 0.1, key="w_f1")
-        wf2 = st.slider("面积差异", 0.0, 5.0, 1.0, 0.1, key="w_f2")
-        wf3 = st.slider("纹理差异", 0.0, 5.0, 0.5, 0.1, key="w_f3")
-        wf4 = st.slider("文字易读", 0.0, 5.0, 2.0, 0.1, key="w_f4")
-        
+        ref_tex = st.slider("纹理基准", 10.0, 100.0, 50.0)
+        t_clarity = st.slider("高光/清晰阈值", 0.5, 0.9, 0.7)
+    
+    with st.expander("⚖️ 评分权重与容差", expanded=False):
+        st.info("自定义 13 个维度的评分影响因子")
+        dims_geo = [('composition_diagonal', '对角线'), ('composition_thirds', '三分法'), ('composition_balance', '平衡度'), ('composition_symmetry', '对称性')]
+        dims_color = [('color_saturation', '饱和度'), ('color_brightness', '亮度'), ('color_warmth', '暖色调'), ('color_contrast', '对比度'), ('color_clarity', '清晰度')]
+        dims_content = [('fg_color_diff', '主体色差'), ('fg_area_diff', '主体占比'), ('fg_texture_diff', '纹理差异'), ('fg_text_legibility', '文字易读')]
+        loaded_weights = {}
+        loaded_tols = {}
+        if current_profile:
+            loaded_weights = current_profile.get('weights', {})
+            loaded_tols = current_profile.get('tolerances', {})
+        tab_w, tab_t = st.tabs(["📊 权重", "🎯 容差"])
+        final_weights = {}
+        final_tols = {}
+        def render_sliders(tab, category_name, dims, is_weight=True):
+            tab.caption(f"**{category_name}**")
+            for k, label in dims:
+                if is_weight:
+                    default_val = float(loaded_weights.get(k, 1.0))
+                    key = f"w_{k}"
+                    if key in st.session_state and st.session_state[key] > 5.0:
+                        st.session_state[key] = default_val
+                    val = tab.slider(label, 0.0, 5.0, default_val, 0.1, key=key)
+                    final_weights[k] = val
+                else:
+                    val_from_file = loaded_tols.get(k)
+                    if not val_from_file and current_profile and 'positive' in current_profile:
+                        if k in current_profile['positive'] and isinstance(current_profile['positive'][k], dict):
+                             val_from_file = current_profile['positive'][k].get('tolerance')
+                    elif not val_from_file and current_profile and k in current_profile and isinstance(current_profile[k], dict):
+                        val_from_file = current_profile[k].get('tolerance')
+                    default_val = float(val_from_file) if val_from_file else 0.2
+                    max_val = max(1.0, default_val * 2.5)
+                    key = f"t_{k}"
+                    if key in st.session_state and st.session_state[key] > max_val:
+                        st.session_state[key] = default_val
+                    val = tab.slider(label, 0.0, max_val, default_val, max_val/50, key=key)
+                    final_tols[k] = val
+        with tab_w:
+            render_sliders(tab_w, "📐 构图", dims_geo, True)
+            st.markdown("---")
+            render_sliders(tab_w, "🎨 色彩", dims_color, True)
+            st.markdown("---")
+            render_sliders(tab_w, "🌗 图底", dims_content, True)
+        with tab_t:
+            render_sliders(tab_t, "📐 构图", dims_geo, False)
+            st.markdown("---")
+            render_sliders(tab_t, "🎨 色彩", dims_color, False)
+            st.markdown("---")
+            render_sliders(tab_t, "🌗 图底", dims_content, False)
     config = {
-        'process_width': p_width, 'seg_kmeans_k': k_num, 'comp_diag_slope': t_diag, 
-        'comp_sym_blur_k': t_sym_blur, 'fg_tex_norm': ref_tex, 
-        'comp_thirds_slope': 0.2, 'comp_sym_tolerance': 120.0, 
-        'color_clarity_thresh': 0.7, 'text_score_thresh': 60.0,
-        'w_comp_diagonal': wc1, 'w_comp_thirds': wc2, 'w_comp_balance': wc3, 'w_comp_symmetry': wc4,
-        'w_color_clarity': wl1, 'w_color_contrast': wl2, 'w_color_saturation': wl3, 'w_color_warmth': wl4, 'w_color_brightness': wl5,
-        'w_fg_color': wf1, 'w_fg_area': wf2, 'w_fg_texture': wf3, 'w_fg_text': wf4
+        'process_width': p_width,
+        'seg_kmeans_k': k_num,
+        'comp_diag_slope': t_diag,
+        'comp_sym_blur_k': t_sym_blur,
+        'fg_tex_norm': ref_tex,
+        'color_clarity_thresh': t_clarity,
+        'comp_thirds_slope': 0.2,
+        'comp_sym_tolerance': 120.0,
+        'text_score_thresh': 60.0,
+        'weights': final_weights,
+        'tolerances': final_tols
     }
 
-    if mode == "批量工厂":
-        st.subheader("📂 批量任务")
-        batch_files = st.file_uploader("多选图片", type=["jpg","png"], accept_multiple_files=True)
-        c1, c2 = st.columns(2)
-        with c1: opt_csv = st.checkbox("数据表", value=True)
-        with c2: opt_zip = st.checkbox("图包", value=True)
-        
-        if batch_files:
-            st.button("🚀 开始运行", type="primary", on_click=run_batch_process, args=(batch_files, config, opt_csv, opt_zip))
-        
-        # --- 下载区域 ---
-        if st.session_state.batch_df is not None:
-            st.divider()
-            st.success(f"已生成 {len(st.session_state.batch_df)} 条记录")
-            
-            # 1. 简单的 CSV 下载
-            st.download_button("📄 下载纯数据 (.csv)", 
-                               data=st.session_state.batch_df.to_csv(index=False).encode('utf-8-sig'), 
-                               file_name="batch_data.csv", mime="text/csv")
-            
-            # 2. [核心功能] 带图的 Excel 下载
-            if st.session_state.batch_imgs:
-                # 实时生成 Excel (因为 BytesIO 对象是一次性的，建议点击时生成)
-                excel_data = to_excel_with_all_images(st.session_state.batch_df, st.session_state.batch_imgs)
-                st.download_button("📊 下载全景报表 (.xlsx)", 
-                                   data=excel_data, 
-                                   file_name="visual_report_full.xlsx", 
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   type="primary",
-                                   help="包含数据和所有13个维度的缩略图，文件较大")
-            
-            # 3. ZIP 下载
-            if st.session_state.batch_zip:
-                st.download_button("📦 下载原图包 (.zip)", 
-                                   data=st.session_state.batch_zip, 
-                                   file_name="batch_images.zip", mime="application/zip")
-
 # ==========================================
-# 🔵 主界面逻辑 (保持不变，或根据需要简化)
+# 6. 主界面逻辑
 # ==========================================
-if mode == "🏆 建立标杆":
-    st.title("🏆 行业视觉标杆管理")
-    def make_serializable(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return obj
 
-    st.subheader("📂 1. 加载已有标杆")
-    uploaded_config = st.file_uploader("上传标杆配置文件 (.json)", type=["json"])
-    if uploaded_config is not None:
-        try:
-            profile_data = json.load(uploaded_config)
-            if "composition_diagonal" in profile_data:
-                st.session_state.benchmark_profile = profile_data
-                st.success(f"✅ 成功加载标杆配置！文件名: {uploaded_config.name}")
-                st.json(profile_data, expanded=False)
-            else:
-                st.error("❌ 无效的配置文件格式")
-        except Exception as e:
-            st.error(f"❌ 解析失败: {e}")
-
-    st.divider()
-
-    st.subheader("🏋️ 2. 训练新标杆")
-    st.markdown("上传 **10张以上** 符合该行业/风格标准的优质图片，系统将自动提取其视觉特征指纹。")
-    ref_files = st.file_uploader("上传训练集图片", type=['jpg', 'png'], accept_multiple_files=True)
-    if ref_files:
-        st.info(f"已选择 {len(ref_files)} 张样本")
-        if st.button("🚀 开始训练模型", type="primary"):
-            progress = st.progress(0)
-            status = st.empty()
-            reports = []
-            bm_manager = BenchmarkManager()
-            for i, f in enumerate(ref_files):
-                status.text(f"正在分析样本 {i+1}/{len(ref_files)}: {f.name}")
-                try:
-                    f_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
-                    img = cv2.imdecode(f_bytes, cv2.IMREAD_COLOR)
-                    d = engine.analyze(img, config=config)
-                    reports.append(d)
-                except Exception as e:
-                    st.warning(f"跳过损坏样本 {f.name}: {e}")
-                progress.progress((i+1)/len(ref_files))
-            if reports:
-                profile = bm_manager.create_profile(reports)
-                st.session_state.benchmark_profile = profile
-                status.success("🎉 标杆模型训练完成！已应用到当前会话。")
-                st.subheader("💾 3. 导出配置")
-                json_str = json.dumps(profile, default=make_serializable, indent=4)
-                st.download_button(
-                    label="📥 下载标杆配置 (.json)",
-                    data=json_str,
-                    file_name="aesthetic_benchmark_profile.json",
-                    mime="application/json"
-                )
-                with st.expander("查看模型参数细节"):
-                    st.json(profile)
-            else:
-                st.error("没有有效的样本数据，无法训练。")
-
-    if st.session_state.benchmark_profile:
-        st.sidebar.divider()
-        st.sidebar.success("✅ 标杆模式：已激活")
-        if st.sidebar.button("清除当前标杆"):
-            st.session_state.benchmark_profile = None
-            st.rerun()
-elif mode == "批量工厂":
-    st.title("📦 批量处理中心")
-    if st.session_state.processing:
-        st.info("正在后台处理中，请勿刷新页面...")
-        with st.expander("查看实时日志", expanded=True):
-            for log in st.session_state.batch_logs[-5:]: st.text(log)
+# --- 模式 1: 批量工厂 (UI 更新) --- 
+if mode == "📦 批量工厂": 
+    st.title("📦 批量处理中心") 
+    if st.session_state.benchmark_profile: 
+        st.subheader("当前标准：🏆 行业标杆匹配度检测") 
+    else: 
+        st.subheader("当前标准：🌐 通用美学质量评分") 
     
-    if st.session_state.batch_df is not None:
-        st.subheader("📊 结果预览")
-        st.dataframe(st.session_state.batch_df.style.background_gradient(subset=['总分'], cmap="RdYlGn"), use_container_width=True, height=600)
-    else:
-        st.info("👈 请在左侧侧边栏上传图片并点击【开始运行】")
+    with st.container(): 
+        batch_files = st.file_uploader("📂 选择图片", type=["jpg","png","jpeg"], accept_multiple_files=True) 
+    
+    if batch_files: 
+        st.divider() 
+        c1, c2, c3 = st.columns([2, 1, 1]) 
+        with c1: st.info(f"已加载 **{len(batch_files)}** 张图片") 
+        with c2: opt_zip = st.checkbox("生成全套图包", value=True, help="包含所有中间过程的诊断图 (构图、热力、Mask等)") 
+        with c3: 
+            st.button("🚀 开始批量分析", type="primary", use_container_width=True, 
+                      on_click=run_batch_process, 
+                      args=(batch_files, config, opt_zip, st.session_state.benchmark_profile)) 
+    
+    if st.session_state.processing: 
+        st.divider(); st.warning("⏳ 正在进行全维度分析，请稍候...") 
+        with st.expander("实时日志"): st.text("\n".join(st.session_state.batch_logs[-10:])) 
+    
+    if st.session_state.batch_df is not None: 
+        st.divider() 
+        st.subheader("3. 结果交付 (全维度)") 
+        st.success(f"✅ 处理完成！已生成 13 维度完整数据。") 
+        tab_main, tab_diff = st.tabs(["📋 完整得分表", "📊 标杆偏差表 (Diff)"]) 
+        with tab_main: 
+            st.dataframe(st.session_state.batch_df, use_container_width=True, height=400) 
+        with tab_diff: 
+            if 'batch_diff_df' in st.session_state: 
+                st.dataframe(st.session_state.batch_diff_df.style.background_gradient(cmap="RdBu_r", vmin=-50, vmax=50), use_container_width=True, height=400) 
+            else: 
+                st.info("需要加载标杆模型才能查看偏差表。") 
+        st.divider() 
+        st.markdown("### 📥 下载中心") 
+        d1, d2, d3, d4 = st.columns(4) 
+        with d1: 
+            if st.session_state.batch_imgs: 
+                excel_data = to_excel_with_all_images(st.session_state.batch_df, st.session_state.batch_imgs) 
+                st.download_button("📊 完整报表 (Excel+图)", excel_data, "Report_Full_Visual.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True) 
+        with d2: 
+            if 'batch_diff_df' in st.session_state: 
+                st.download_button("📉 偏差分析表 (Diff CSV)", st.session_state.batch_diff_df.to_csv(index=False).encode('utf-8-sig'), "Report_Diff_Analysis.csv", "text/csv", use_container_width=True) 
+        with d3: 
+            if 'batch_raw_json' in st.session_state: 
+                json_str = json.dumps(st.session_state.batch_raw_json, default=make_serializable, indent=4) 
+                st.download_button("⚙️ 原始参数 (JSON)", json_str, "Raw_Parameters.json", "application/json", use_container_width=True) 
+        with d4: 
+            if st.session_state.batch_zip: 
+                st.download_button("📦 诊断图包 (ZIP)", st.session_state.batch_zip, "Diagnostic_Images.zip", "application/zip", use_container_width=True) 
+    elif not batch_files: 
+        st.divider(); st.caption("👈 请先上传图片开始工作...")
 
+# --- 模式 2: 单图诊断 (完整修复版：13指标 + 全套诊断图) ---
 elif mode == "📸 单图诊断":
     st.title("🧿 单图深度诊断")
-    uploaded_file = st.file_uploader("上传单张图片", type=['jpg', 'png', 'jpeg'])
+    uploaded_file = st.file_uploader("上传图片", type=['jpg','png','jpeg'])
+    
     if uploaded_file:
         image_pil = Image.open(uploaded_file)
-        img_np = np.array(image_pil.convert('RGB'))
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        with st.spinner("AI 正在全维扫描..."):
+        img_bgr = cv2.cvtColor(np.array(image_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
+
+        # 1. AI 分析与评分
+        with st.spinner("AI 正在进行全维度扫描..."):
             data = engine.analyze(img_bgr, config=config)
-        # 使用标杆或通用评分
-        if st.session_state.benchmark_profile:
-            bm_manager = BenchmarkManager()
-            bm_res = bm_manager.score_against_benchmark(data, st.session_state.benchmark_profile)
-            final_score = bm_res['total_score']
-            final_rating = bm_res['rating_level']
-            summary_text = f"基于标杆对比：该图片与标准样本的匹配度为 {final_score}%。"
-            is_benchmark_mode = True
-            benchmark_details = bm_res.get('details', {})
-            report = None
-        else:
-            report = AestheticDiagnostician.generate_report(data, config=config)
-            final_score = report['total_score']
-            final_rating = report['rating_level']
-            summary_text = report['summary']
-            is_benchmark_mode = False
-            benchmark_details = None
-        st.header("📝 AI 美学诊断报告")
-        rep_c1, rep_c2 = st.columns([1, 2])
-        with rep_c1:
-            mode_label = "基于标杆" if is_benchmark_mode else "通用标准"
-            st.metric(
-                label="综合美学评分",
-                value=f"{final_score} / 100",
-                delta=final_rating,
-                help=f"当前评分模式：{mode_label}"
-            )
-        with rep_c2:
-            if not is_benchmark_mode and report is not None:
-                st.caption("AI 识别风格标签：")
-                tags_html = "".join([f"<span style='background-color:#eee; padding:4px 10px; margin:0 5px; border-radius:15px; font-size:14px'>{tag}</span>" for tag in report['style_tags']])
-                st.markdown(tags_html, unsafe_allow_html=True)
-            st.info(f"💡 **总结**：{summary_text}")
-        adv_c1, adv_c2 = st.columns(2)
-        with adv_c1:
-            st.subheader("✅ 亮点 (Pros)")
-            if not is_benchmark_mode and report is not None and report['pros']:
-                for item in report['pros']:
-                    st.markdown(f"- {item}")
+            
+            is_bench = st.session_state.benchmark_profile is not None
+            bench_details = {}
+            
+            if is_bench:
+                bm = BenchmarkManager()
+                # 双向评分
+                res = calculate_dual_score(data, st.session_state.benchmark_profile, bm)
+                final_score = res['total_score']
+                final_rating = res['rating_level']
+                bench_details = res['details']
+                score_breakdown = res.get('score_breakdown')
+                mode_display = res.get('mode', '标杆')
             else:
-                st.write("暂无显著亮点，表现平稳。")
-        with adv_c2:
-            st.subheader("⚠️ 改进点 (Cons)")
-            if not is_benchmark_mode and report is not None and report['cons']:
-                for item in report['cons']:
-                    st.markdown(f"- {item}")
-            else:
-                st.write("未发现明显缺陷，非常完美！")
-        st.divider()
-        top_c1, top_c2 = st.columns([1, 1])
-        with top_c1:
-            st.subheader("原始图像")
+                rep = AestheticDiagnostician.generate_report(data, config=config)
+                final_score, final_rating = rep['total_score'], rep['rating_level']
+                mode_display = "通用"
+                score_breakdown = None
+
+        # 2. 界面布局
+        c1, c2 = st.columns([1, 1.2])
+        
+        # --- 左列：核心数据与指标卡 ---
+        with c1:
             st.image(image_pil, use_container_width=True)
-        with top_c2:
-            st.subheader("特征雷达图 (实测 vs 标杆)")
-            categories = [
-                '<b>构图</b><br>对角线', '<b>构图</b><br>三分法', '<b>构图</b><br>平衡', '<b>构图</b><br>稳定性',
-                '<b>色彩</b><br>暖色', '<b>色彩</b><br>饱和度', '<b>色彩</b><br>亮度', '<b>色彩</b><br>对比度', '<b>色彩</b><br>清晰度',
-                '<b>图底</b><br>面积差', '<b>图底</b><br>色差', '<b>图底</b><br>纹理',
-                '<b>文字</b><br>易读性'
-            ]
-            current_vals = normalize_values(data, is_profile=False)
-            benchmark_vals = normalize_values(st.session_state.benchmark_profile, is_profile=True) if st.session_state.benchmark_profile else None
-            fig = go.Figure()
-            if benchmark_vals:
-                fig.add_trace(go.Scatterpolar(
-                    r=benchmark_vals + [benchmark_vals[0]],
-                    theta=categories + [categories[0]],
-                    fill='toself',
-                    fillcolor='rgba(200, 200, 200, 0.2)',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    name='行业标杆均值',
-                    hoverinfo='text',
-                    text=[f"标杆: {v:.1f}" for v in benchmark_vals + [benchmark_vals[0]]]
-                ))
-            fig.add_trace(go.Scatterpolar(
-                r=current_vals + [current_vals[0]],
-                theta=categories + [categories[0]],
-                fill='toself',
-                fillcolor='rgba(0, 191, 255, 0.3)',
-                line=dict(color='deepskyblue', width=3),
-                mode='lines+markers',
-                marker=dict(size=6, color='dodgerblue'),
-                name='当前图片',
-                hoverinfo='text',
-                text=[f"实测: {v:.1f}" for v in current_vals + [current_vals[0]]]
-            ))
-            fig.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=True, range=[0, 100], tickvals=[20,60,100], tickfont=dict(size=8, color='gray')),
-                    angularaxis=dict(tickfont=dict(size=10))
-                ),
-                margin=dict(l=40, r=40, t=20, b=20),
-                height=380,
-                legend=dict(yanchor="bottom", y=0, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
-        if is_benchmark_mode and benchmark_details:
+            
+            st.metric("🏆 综合得分", f"{final_score:.1f}", delta=f"{final_rating} ({mode_display})")
+            
+            if score_breakdown:
+                pos = score_breakdown['pos']
+                neg = score_breakdown['neg']
+                st.info(f"✅ 正向拟合: {pos:.1f} | ⛔ 负向排斥: {neg:.1f}")
+
             st.divider()
-            st.subheader("📊 标杆偏差深度分析")
-            metrics_list = [
-                ('构图:对角线', 'composition_diagonal'), ('构图:三分法', 'composition_thirds'),
-                ('构图:平衡', 'composition_balance'), ('构图:稳定性', 'composition_symmetry'),
-                ('色彩:暖色%', 'color_warmth'), ('色彩:饱和度', 'color_saturation'),
-                ('色彩:亮度', 'color_brightness'), ('色彩:对比度', 'color_contrast'),
-                ('色彩:清晰度', 'color_clarity'), ('图底:面积差', 'fg_area_diff'),
-                ('图底:色差', 'fg_color_diff'), ('图底:纹理差', 'fg_texture_diff'),
-                ('文字:易读性', 'fg_text_legibility')
-            ]
-            for i in range(0, len(metrics_list), 4):
-                cols = st.columns(4)
-                for j in range(4):
-                    if i + j < len(metrics_list):
-                        label, key = metrics_list[i+j]
-                        item = benchmark_details.get(key)
-                        if not item:
-                            continue
-                        target = float(item['target'])
-                        actual = float(item['actual'])
-                        score = int(item['score'])
-                        val_str = f"{actual:.2f}"
-                        delta_val = actual - target
-                        delta_str = f"{delta_val:+.2f} (标杆 {target:.2f})"
-                        with cols[j]:
-                            st.metric(label=label, value=val_str, delta=delta_str, delta_color="normal", help=f"匹配度得分: {score}")
-        st.divider()
-        tab1, tab2, tab3 = st.tabs(["📐 构图", "🎨 色彩", "🌗 图底 & 文字"])
-        with tab1:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("对角线主导 (范围: 0-100)", f"{data.composition_diagonal}")
-            c2.metric("三分法契合 (范围: 0-100)", f"{data.composition_thirds}")
-            c3.metric("物理分布平衡 (范围: 0-100)", f"{data.composition_balance}")
-            sym_score = float(getattr(data, 'composition_symmetry', getattr(data, 'color_symmetry', 0)))
-            c4.metric("视觉色彩平衡 (范围: 0-100)", f"{sym_score}")
-            img_c1, img_c2, img_c3, img_c4 = st.columns(4)
-            if getattr(data, 'vis_diag', None) is not None: img_c1.image(data.vis_diag, use_container_width=True, caption="对角线辅助线")
-            if getattr(data, 'vis_thirds', None) is not None: img_c2.image(data.vis_thirds, use_container_width=True, caption="三分法连线")
-            if getattr(data, 'vis_balance', None) is not None: img_c3.image(data.vis_balance, use_container_width=True, caption="左右力矩分布")
-            if getattr(data, 'vis_symmetry_heatmap', None) is not None: img_c4.image(data.vis_symmetry_heatmap, use_container_width=True, caption="镜像色差热力图")
-        with tab2:
-            st.markdown("#### 🎨 色彩与光影分析")
-            c1, c2 = st.columns([1.5, 1])
-            with c1:
-                r1c1, r1c2 = st.columns(2)
-                with r1c1:
-                    st.metric("暖色调占比 (范围: 0-100%)", f"{data.color_warmth:.0%}")
-                    if getattr(data, 'vis_warmth', None) is not None: st.image(data.vis_warmth, use_container_width=True, caption="分布图(红暖蓝冷)")
-                with r1c2:
-                    st.metric("平均饱和度 (范围: 0.0-1.0 Chroma)", f"{data.color_saturation:.2f}")
-                    if getattr(data, 'vis_saturation', None) is not None: st.image(data.vis_saturation, use_container_width=True, caption="热力图(红高蓝低)")
-                st.divider()
-                r2c1, r2c2 = st.columns(2)
-                with r2c1:
-                    st.metric("平均亮度 (范围: 0-1 L)", f"{data.color_brightness:.2f}")
-                    if getattr(data, 'vis_brightness', None) is not None: st.image(data.vis_brightness, use_container_width=True, caption="亮度分布(人眼灰度)")
-                with r2c2:
-                    st.metric("光影对比度 (范围: 0.0-0.5+ StdDev)", f"{data.color_contrast:.2f}")
-                    if getattr(data, 'vis_contrast', None) is not None: st.image(data.vis_contrast, use_container_width=True, caption="明暗色阶(黑/灰/白)")
-            with c2:
-                st.metric("高亮区域占比 (范围: 0-100%)", f"{data.color_clarity:.0%}")
-                if getattr(data, 'vis_clarity', None) is not None: st.image(data.vis_clarity, use_container_width=True, caption="清晰度分布图 (聚光灯效果)")
-                score_clarity = data.color_clarity
-                if score_clarity > 0.85:
-                    st.error("💥 严重过曝：高光溢出，画面细节丢失，视觉刺眼。")
-                elif score_clarity > 0.3:
-                    st.success("☀️ 通透清晰：画面有充足的高光区域，视觉传达效率高。")
-                elif score_clarity > 0.1:
-                    st.info("☁️ 柔和/自然：光照分布均匀，可能具有电影感或胶片感。")
+
+            def smart_card(col, label, key, unit="", multiplier=1.0):
+                raw_val = getattr(data, key, 0)
+                if raw_val is None: raw_val = 0
+                
+                if is_bench and key in bench_details:
+                    item = bench_details[key]
+                    score = item['score']
+                    target = item['target'] * multiplier
+                    actual = item['actual'] * multiplier
+                    
+                    if score >= 80: state = "normal"
+                    elif score >= 60: state = "off"
+                    else: state = "inverse"
+                    
+                    col.metric(
+                        label,
+                        f"{score:.0f}分",
+                        f"实测{actual:.1f}{unit} / 标杆{target:.1f}",
+                        delta_color=state
+                    )
                 else:
-                    st.warning("🌫️ 沉闷/雾感：高光缺失，画面可能显得灰暗或对焦不清。")
-        with tab3:
-            st.markdown("#### 🔤 文字易读性诊断")
+                    col.metric(label, f"{raw_val*multiplier:.1f}{unit}")
+
+            st.caption("📐 构图几何")
+            r1a, r1b = st.columns(2)
+            smart_card(r1a, "对角线", "composition_diagonal")
+            smart_card(r1b, "三分法", "composition_thirds")
+            r1c, r1d = st.columns(2)
+            smart_card(r1c, "平衡度", "composition_balance")
+            smart_card(r1d, "对称性", "composition_symmetry")
+
+            st.caption("🎨 色彩氛围")
+            r2a, r2b, r2c = st.columns(3)
+            smart_card(r2a, "饱和度", "color_saturation", "%", 100)
+            smart_card(r2b, "亮度", "color_brightness", "%", 100)
+            smart_card(r2c, "暖色调", "color_warmth", "%", 100)
+            r2d, r2e = st.columns(2)
+            smart_card(r2d, "对比度", "color_contrast", "", 1.0)
+            smart_card(r2e, "清晰度", "color_clarity", "%", 100)
+
+            st.caption("🌗 图底与信息")
+            r3a, r3b = st.columns(2)
+            smart_card(r3a, "主体色差", "fg_color_diff")
+            smart_card(r3b, "主体占比", "fg_area_diff", "%", 100)
+            r3c, r3d = st.columns(2)
+            smart_card(r3c, "纹理差异", "fg_texture_diff")
             if getattr(data, 'fg_text_present', False):
-                c1, c2 = st.columns([1.5, 1])
-                with c1:
-                    if getattr(data, 'vis_text_analysis', None) is not None: st.image(data.vis_text_analysis, use_container_width=True, caption="易读性诊断 (数字为综合评分)")
-                with c2:
-                    st.metric("文字综合易读性 (范围: 0-100)", f"{data.fg_text_legibility}/100", delta=("优秀" if data.fg_text_legibility > 80 else "需优化"))
-                    st.metric("平均对比度 (范围: 0-200+ ΔE)", f"{data.fg_text_contrast:.1f}")
-                    st.info("诊断图例：\n- 🟩 绿框：易读 (Score > 60)\n- 🟥 红框：难辨 (Score < 60)")
-                    if data.fg_text_legibility < 60: st.warning("⚠️ 建议：给红框内的文字添加阴影、描边或半透明底板。")
+                smart_card(r3d, "文字易读", "fg_text_legibility")
             else:
-                st.info("ℹ️ 画面中未检测到明显文字。")
+                r3d.metric("文字", "无", delta_color="off")
+
+        # --- 右列：可视化诊断图表 ---
+        with c2:
+            st.subheader("📊 维度雷达")
+            cats = ['对角线','三分法','平衡','对称','饱和','亮度','暖色','对比','清晰','色差','占比','纹理','易读']
+            vals = normalize_values(data, False)
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatterpolar(r=vals, theta=cats, fill='toself', name='当前图片', line_color='#3498db'))
+            
+            if is_bench:
+                bench_vals = normalize_values(st.session_state.benchmark_profile['positive'] if 'positive' in st.session_state.benchmark_profile else st.session_state.benchmark_profile, True)
+                fig.add_trace(go.Scatterpolar(r=bench_vals, theta=cats, fill='toself', name='标杆基准', line_color='#2ecc71', opacity=0.4))
+                
+            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, height=350, margin=dict(t=20, b=20, l=40, r=40))
+            st.plotly_chart(fig, use_container_width=True)
+
             st.divider()
-            st.markdown("#### 🖼️ 图形主体分析")
-            c1a, c2a, c3a = st.columns(3)
-            c1a.metric("面积差异 (范围: 0.0-1.0)", f"{data.fg_area_diff:.2f}")
-            c2a.metric("色彩差异 (范围: 0-200+ ΔE)", f"{data.fg_color_diff:.1f}")
-            c3a.metric("纹理差异 (范围: 0.0-1.0)", f"{data.fg_texture_diff:.3f}")
-            vc1, vc2, vc3 = st.columns([1, 1, 1.5])
-            with vc1:
-                st.caption("1. AI 主体分割 (Mask)")
-                _mask = getattr(data, 'vis_mask', None)
-                if _mask is not None:
-                    mask_display = (_mask.astype(np.uint8) * 255) if _mask.max() <= 1 else _mask
-                    st.image(mask_display, use_container_width=True, clamp=True)
-                else:
-                    st.warning("未生成")
-            with vc2:
-                st.caption("2. 平均色彩抽离 (Color)")
-                _color = getattr(data, 'vis_color_contrast', None)
-                if _color is not None:
-                    st.image(_color, use_container_width=True, caption=f"Diff: {data.fg_color_diff}")
-                    if data.fg_color_diff > 100: st.caption("✅ 强对比 (撞色)")
-                    elif data.fg_color_diff < 50: st.caption("⚠️ 弱对比 (顺色)")
-                else:
-                    st.warning("未生成")
-            with vc3:
-                st.caption("3. 纹理密度对比 (Texture)")
-                _comp = getattr(data, 'vis_edge_composite', None)
-                if _comp is not None:
-                    composite_display = _comp.astype(np.uint8)
-                    st.image(composite_display, use_container_width=True, caption="绿=前景 | 红=背景")
-                    st.info("🟢 绿色：前景纹理 | 🔴 红色：背景纹理")
-                else:
-                    st.warning("未生成")
+            st.subheader("🔎 AI 视觉诊断图谱")
+            
+            t_comp, t_color, t_content, t_curve = st.tabs(["📐 构图视角", "🎨 色彩热力", "🌗 主体识别", "🔬 Luv 分布曲线"]) 
+            
+            with t_comp:
+                c_t1, c_t2 = st.columns(2)
+                if getattr(data, 'vis_diag', None) is not None:
+                    c_t1.image(data.vis_diag, caption="对角线引导", use_container_width=True)
+                if getattr(data, 'vis_thirds', None) is not None:
+                    c_t2.image(data.vis_thirds, caption="三分法参考", use_container_width=True)
+                
+                c_t3, c_t4 = st.columns(2)
+                if getattr(data, 'vis_balance', None) is not None:
+                    c_t3.image(data.vis_balance, caption="视觉平衡点", use_container_width=True)
+                if getattr(data, 'vis_symmetry_heatmap', None) is not None:
+                    c_t4.image(data.vis_symmetry_heatmap, caption="对称性热力图", use_container_width=True)
+
+            with t_color:
+                c_c1, c_c2 = st.columns(2)
+                if getattr(data, 'vis_warmth', None) is not None:
+                    c_c1.image(data.vis_warmth, caption="暖色调分布", use_container_width=True)
+                if getattr(data, 'vis_saturation', None) is not None:
+                    c_c2.image(data.vis_saturation, caption="饱和度分布", use_container_width=True)
+                
+                c_c3, c_c4 = st.columns(2)
+                if getattr(data, 'vis_brightness', None) is not None:
+                    c_c3.image(data.vis_brightness, caption="亮度分布", use_container_width=True)
+                if getattr(data, 'vis_clarity', None) is not None:
+                    c_c4.image(data.vis_clarity, caption="清晰度/边缘", use_container_width=True)
+
+            with t_content:
+                c_f1, c_f2 = st.columns(2)
+                if getattr(data, 'vis_mask', None) is not None:
+                    c_f1.image(data.vis_mask, caption="主体分割 Mask", use_container_width=True)
+                if getattr(data, 'vis_color_contrast', None) is not None:
+                    c_f2.image(data.vis_color_contrast, caption="色彩抽离对比", use_container_width=True)
+                
+                c_f3, c_f4 = st.columns(2)
+                if getattr(data, 'vis_edge_composite', None) is not None:
+                    c_f3.image(data.vis_edge_composite, caption="纹理复杂度对比", use_container_width=True)
+                
+                if getattr(data, 'fg_text_present', False) and getattr(data, 'vis_text_analysis', None) is not None:
+                    c_f4.image(data.vis_text_analysis, caption="文字区域检测", use_container_width=True)
+                elif not getattr(data, 'fg_text_present', False):
+                    c_f4.info("未检测到显著文字")
+
+            with t_curve:
+                st.markdown("#### 🔬 Luv 空间感知分布")
+                st.caption("基于 CIE Luv 感知均匀色彩空间，使用 推土机距离 (EMD) 对比分布形态。")
+                from luv_analysis import LUVAnalysisEngine
+                from histogram_scorer import DistributionScorer
+                luv_engine = LUVAnalysisEngine()
+                scorer = DistributionScorer()
+                curr_luv = luv_engine.extract_luv_distributions(img_bgr)
+                bench_luv = st.session_state.benchmark_profile.get('luv_curves') if is_bench else None
+                scores = None
+                if is_bench and bench_luv:
+                    scores = scorer.evaluate_luv_quality(curr_luv, bench_luv)
+                def plot_luv_curve(title, y_curr, y_bench=None, color="#333"):
+                    fig = go.Figure()
+                    x_axis = np.linspace(0, 100, len(y_curr))
+                    fig.add_trace(go.Scatter(x=x_axis, y=y_curr, mode='lines', fill='tozeroy', name='当前', line=dict(color=color, width=2)))
+                    if y_bench is not None:
+                        fig.add_trace(go.Scatter(x=x_axis, y=y_bench, mode='lines', name='标杆', line=dict(color='gray', width=2, dash='dash')))
+                    fig.update_layout(title=dict(text=title, font=dict(size=14)), xaxis=dict(showgrid=False, title="强度 %"), yaxis=dict(showgrid=False, showticklabels=False), height=200, margin=dict(t=30, b=10, l=10, r=10), showlegend=False)
+                    return fig
+                c_l, c_c, c_h = st.columns(3)
+                with c_l:
+                    title = "**💡 感知亮度 (L)**"
+                    if scores:
+                        s = scores['score_L']
+                        color = "green" if s > 80 else "red"
+                        title += f" <span style='color:{color}; font-size:1.2em'>{s:.0f}分</span>"
+                    st.markdown(title, unsafe_allow_html=True)
+                    st.plotly_chart(plot_luv_curve("", curr_luv['dist_L'], bench_luv['dist_L'] if bench_luv else None, "#f1c40f"), use_container_width=True)
+                    st.caption("波峰靠右=高调；波峰靠左=低调；双峰=高对比。")
+                with c_c:
+                    title = "**🎨 感知彩度 (C)**"
+                    if scores:
+                        s = scores['score_C']
+                        color = "green" if s > 80 else "red"
+                        title += f" <span style='color:{color}; font-size:1.2em'>{s:.0f}分</span>"
+                    st.markdown(title, unsafe_allow_html=True)
+                    st.plotly_chart(plot_luv_curve("", curr_luv['dist_C'], bench_luv['dist_C'] if bench_luv else None, "#e74c3c"), use_container_width=True)
+                    st.caption("衡量色彩的纯度/鲜艳度。")
+                with c_h:
+                    title = "**🌈 感知色相 (H)**"
+                    if scores:
+                        s = scores['score_H']
+                        color = "green" if s > 80 else "red"
+                        title += f" <span style='color:{color}; font-size:1.2em'>{s:.0f}分</span>"
+                    st.markdown(title, unsafe_allow_html=True)
+                    st.plotly_chart(plot_luv_curve("", curr_luv['dist_H'], bench_luv['dist_H'] if bench_luv else None, "#9b59b6"), use_container_width=True)
+                    st.caption("色彩在光谱中的位置分布。")
+                if scores:
+                    st.info(f"✨ **色彩质感综合得分：{scores['avg_score']:.1f}** (基于 Luv 分布形态相似度计算)")
+
+# --- 模式 3: 建立标杆 (修复加载报错版) --- 
+elif mode == "🏆 建立标杆": 
+    st.title("🏆 建立行业视觉标杆 (Service版)") 
+    
+    # --- [核心修复] 定义加载配置的回调函数 --- 
+    def on_load_config(): 
+        uploaded = st.session_state.get('conf_uploader') 
+        if uploaded is not None: 
+            try: 
+                uploaded.seek(0) 
+                p = json.load(uploaded) 
+                st.session_state.benchmark_profile = p 
+                if 'weights' in p: 
+                    for k, v in p['weights'].items(): 
+                        st.session_state[f"w_{k}"] = float(v) 
+                if 'tolerances' in p: 
+                    for k, v in p['tolerances'].items(): 
+                        st.session_state[f"t_{k}"] = float(v) 
+                st.session_state['_load_msg'] = f"✅ 配置已成功加载: {uploaded.name}" 
+            except Exception as e: 
+                st.session_state['_load_msg'] = f"❌ 文件解析错误: {str(e)}" 
+
+    st.file_uploader( 
+        "📂 加载配置文件", 
+        type=["json"], 
+        key="conf_uploader", 
+        on_change=on_load_config 
+    ) 
+    
+    if '_load_msg' in st.session_state: 
+        if "❌" in st.session_state['_load_msg']: 
+            st.error(st.session_state['_load_msg']) 
+        else: 
+            st.success(st.session_state['_load_msg']) 
+        del st.session_state['_load_msg'] 
+    
+    st.divider() 
+    
+    c_high, c_low = st.columns(2) 
+    with c_high: 
+        st.subheader("👍 正向标杆 (High)") 
+        files_high = st.file_uploader("选择 High 图片", accept_multiple_files=True, key="up_high") 
+    with c_low: 
+        st.subheader("👎 负向标杆 (Low)") 
+        files_low = st.file_uploader("选择 Low 图片", accept_multiple_files=True, key="up_low") 
+
+    use_auto_weight = st.checkbox("🤖 启用自动权重推算 (推荐)", value=True) 
+
+    def call_training_service(f_pos, f_neg, cfg, auto_w): 
+        trainer = BenchmarkTrainer() 
+        try: 
+            status_box = st.empty() 
+            status_box.info("🚀 正叫调用训练服务...") 
+            profile, dist_data, stats = trainer.train(pos_files=f_pos, neg_files=f_neg, config=cfg, auto_weight_enable=auto_w) 
+            st.session_state.benchmark_profile = profile 
+            st.session_state['benchmark_dist_data'] = dist_data 
+            if auto_w and 'weights' in profile: 
+                for k, v in profile['weights'].items(): st.session_state[f"w_{k}"] = float(v) 
+            if 'tolerances' in profile: 
+                for k, v in profile['tolerances'].items(): st.session_state[f"t_{k}"] = float(v) 
+            status_box.empty() 
+            st.session_state['_train_msg'] = f"✅ 训练成功! 正向:{stats['pos_count']}, 负向:{stats['neg_count']}" 
+        except Exception as e: st.error(f"训练服务出错: {str(e)}") 
+
+    if files_high: 
+        st.button("🚀 调用服务开始训练", type="primary", use_container_width=True, 
+                  on_click=call_training_service, args=(files_high, files_low, config, use_auto_weight)) 
+    
+    if '_train_msg' in st.session_state: 
+        st.success(st.session_state['_train_msg']); del st.session_state['_train_msg'] 
+        
+    if st.session_state.benchmark_profile: 
+        st.divider(); st.subheader("📊 训练分析") 
+        if 'benchmark_dist_data' in st.session_state: 
+            with st.expander("📈 查看特征分布 (箱线图)", expanded=True): 
+                dist_data = st.session_state['benchmark_dist_data'] 
+                fig = go.Figure() 
+                for k, vals in dist_data.items(): 
+                    w_val = config['weights'].get(k, 1.0) 
+                    color = '#2ecc71' if w_val >= 2.5 else '#3498db' 
+                    fig.add_trace(go.Box(y=vals, name=k, marker_color=color, boxpoints='all', jitter=0.3)) 
+                fig.update_layout(height=400, showlegend=False, margin=dict(t=20,b=20)) 
+                st.plotly_chart(fig, use_container_width=True) 
+
+        final_pkg = st.session_state.benchmark_profile.copy() 
+        final_pkg['weights'] = config['weights'] 
+        final_pkg['tolerances'] = config['tolerances'] 
+        json_str = json.dumps(final_pkg, default=make_serializable, indent=4) 
+        st.download_button("📦 下载完整配置", json_str, "benchmark_service_output.json", "application/json", type="primary")

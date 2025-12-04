@@ -2,6 +2,7 @@
 headless = true
 enableCORS = true
 enableXsrfProtection = true
+runOnSave = false
 
 [theme]
 primaryColor = "#00BFFF"
@@ -9,3 +10,6 @@ backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F8F9FA"
 textColor = "#222222"
 font = "sans serif"
+
+[browser]
+gatherUsageStats = false
