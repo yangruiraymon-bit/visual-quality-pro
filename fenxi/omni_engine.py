@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import colour
 import easyocr
 from PIL import Image, ImageDraw, ImageFont
 from dataclasses import dataclass
@@ -95,7 +96,7 @@ class ModelRegistry:
 # === OmniReport Data Structure ===
 @dataclass
 class OmniReport:
-    # --- 构图与视觉秩序 ---
+    # --- 构图与视觉秩序 (5) ---
     comp_balance_score: float
     comp_balance_center: Tuple[int, int]
     comp_layout_type: str
@@ -106,7 +107,7 @@ class OmniReport:
     comp_visual_order_score: float
     comp_vanishing_point: Optional[Tuple[int, int]]
     
-    # --- 色彩氛围 ---
+    # --- 色彩氛围 (6) ---
     color_warmth: float
     color_saturation: float
     color_brightness: float
@@ -120,16 +121,16 @@ class OmniReport:
     semantic_score: float       
     vlm_critique: str           
 
-    # --- 图底/文字 ---
+    # --- 图底与信息 (3) ---
     fg_area_diff: float
     fg_color_diff: float
     fg_texture_diff: float
-    fg_text_present: bool
-    fg_text_legibility: float
-    fg_text_contrast: float
-    fg_text_content: str
     
-    # --- 文字排版 ---
+    # --- 文字排版 (4) ---
+    # [Mod] Merged Contrast into Legibility
+    fg_text_present: bool
+    fg_text_legibility: float  # Now represents both clarity and contrast
+    fg_text_content: str
     text_alignment_score: float
     text_hierarchy_score: float
     text_content_ratio: float
@@ -172,11 +173,23 @@ class OmniReport:
     vis_dist_size: Optional[np.ndarray] = None     
     vis_dist_angle: Optional[np.ndarray] = None
     
-    # Legacy placeholders with defaults
+    # Legacy placeholders
     composition_diagonal: float = 0.0
     composition_thirds: float = 0.0
     composition_balance: float = 0.0
     composition_symmetry: float = 0.0
+    
+    def to_feature_vector(self) -> np.ndarray:
+        # [Mod] Reduced to 18 dimensions (removed fg_text_contrast)
+        return np.array([
+            self.comp_balance_score, self.comp_layout_score, self.comp_negative_space_score, 
+            self.comp_visual_flow_score, self.comp_visual_order_score,
+            self.color_saturation * 100, self.color_brightness * 100, self.color_warmth * 100,
+            (self.color_contrast / 0.3) * 100, self.color_clarity * 100, self.color_harmony,
+            self.fg_color_diff, self.fg_area_diff * 100, self.fg_texture_diff * 100,
+            self.fg_text_legibility if self.fg_text_present else 0.0, 
+            self.text_alignment_score, self.text_hierarchy_score, self.text_content_ratio
+        ], dtype=np.float32)
 
 # === 豆包/VLM 分析器 ===
 class DoubaoVLMAnalyzer:
@@ -285,7 +298,6 @@ class HybridSegmenter:
         h, w = image_bgr.shape[:2]
         box_prompts = []
         debug_boxes = []
-        
         final_mask = np.zeros((h, w), dtype=np.uint8)
         EXPAND_RATIO = 0.05
         
@@ -314,8 +326,7 @@ class HybridSegmenter:
                         add_box_with_padding(x, y, x + bw, y + bh, 'object')
                         cv2.drawContours(u2net_valid_mask, [cnt], -1, 255, -1)
                 final_mask = cv2.bitwise_or(final_mask, u2net_valid_mask)
-            except Exception as e:
-                print(f"U2-Net Error: {e}")
+            except Exception: pass
 
         # Fallback
         if not box_prompts and cv2.countNonZero(final_mask) == 0:
@@ -345,8 +356,7 @@ class HybridSegmenter:
                     masks, _, _ = self.sam_predictor.predict(point_coords=None, point_labels=None, box=input_box[None, :], multimask_output=False)
                     mask_uint8 = (masks[0] * 255).astype(np.uint8)
                     final_mask = cv2.bitwise_or(final_mask, mask_uint8)
-            except Exception as e:
-                print(f"SAM Inference Error: {e}")
+            except Exception: pass
         
         # 4. Box Coverage Guarantee
         for box in box_prompts:
@@ -358,7 +368,7 @@ class HybridSegmenter:
                 if fill_ratio < 0.15:
                     cv2.rectangle(final_mask, (x1, y1), (x2, y2), 255, -1)
 
-        # 5. [Force] 强制叠加文字区域
+        # 5. [Force] 强制叠加文字区域 (Simple Polygon Fill)
         if text_boxes:
             for bbox in text_boxes:
                 pts = np.array(bbox, dtype=np.int32)
@@ -375,20 +385,17 @@ class HybridSegmenter:
 # === 全能视觉分析引擎 ===
 class OmniVisualEngine:
     def __init__(self, vlm_api_key=None, vlm_endpoint=None):
-        print("Initializing Omni Engine v18.4 (Final Fix)...")
+        print("Initializing Omni Engine v25.0 (Oklab+Merged)...")
         self.ocr_type = 'easyocr'
         self.ocr_reader = None
         
         if PADDLE_AVAILABLE:
             try:
-                print("🔄 Loading PaddleOCR...")
                 self.ocr_reader = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
                 self.ocr_type = 'paddle'
-            except Exception as e:
-                print(f"⚠️ PaddleOCR Init Failed: {e}")
+            except Exception: pass
         
         if self.ocr_reader is None:
-            print("🔄 Loading EasyOCR (Fallback)...")
             self.ocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False, verbose=False)
             self.ocr_type = 'easyocr'
 
@@ -437,17 +444,6 @@ class OmniVisualEngine:
                     cv2.putText(overlay, str(int(count)), (int(x*step_x)+5, int(y*step_y)+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
         return cv2.addWeighted(overlay, 0.6, vis, 0.4, 0)
 
-    def _draw_dist_size_map(self, vis, visual_elements, valid_contours):
-        vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
-        if not visual_elements: return vis
-        areas = [x['area'] for x in visual_elements]; max_area = max(areas) if areas else 1
-        for item, cnt in zip(visual_elements, valid_contours):
-            norm_size = item['area'] / max_area
-            b = int(255 * (1 - norm_size)); g = int(100 * (1 - abs(norm_size - 0.5)*2)); r = int(255 * norm_size)
-            cv2.drawContours(vis, [cnt], -1, (b, g, r), -1); cv2.drawContours(vis, [cnt], -1, (255,255,255), 1)
-            cx, cy = item['centroid']; cv2.putText(vis, f"S:{int(item['area'])}", (cx-20, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-        return vis
-
     def _draw_dist_angle_map(self, vis, visual_elements, valid_contours):
         vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
         for item, cnt in zip(visual_elements, valid_contours):
@@ -458,6 +454,41 @@ class OmniVisualEngine:
             cv2.line(vis, (cx, cy), (end_x, end_y), (0, 255, 255), 2); cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
             cv2.putText(vis, f"{int(angle)}d", (cx+5, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         return vis
+
+    def _calc_oklab_score(self, bgr_txt, bgr_bg):
+        """
+        使用 colour-science 库计算 Oklab 空间的色彩对比度。
+        [Fixed] 修复了 cv2.mean 返回值 (B,G,R,A) 导致通道错乱的问题
+        """
+        try:
+            # 1. 预处理：BGR转RGB，并归一化到 0-1
+            # cv2.mean 返回 (B, G, R, 0.0) 的 4 元组，必须显式取前 3 个
+            t_bgr = np.array(bgr_txt[:3], dtype=np.float32)
+            b_bgr = np.array(bgr_bg[:3], dtype=np.float32)
+
+            # BGR -> RGB (反转前3个通道)
+            rgb_txt = t_bgr[::-1] / 255.0
+            rgb_bg = b_bgr[::-1] / 255.0
+
+            # 2. 色彩空间转换：sRGB -> Oklab (Auto Gamma Decoding)
+            lab_txt = colour.convert(rgb_txt, 'sRGB', 'Oklab')
+            lab_bg = colour.convert(rgb_bg, 'sRGB', 'Oklab')
+
+            # 3. 计算欧几里得距离 (Perceptual Distance)
+            distance = float(np.linalg.norm(lab_txt - lab_bg))
+
+            # 4. 评分归一化
+            # Oklab 中黑白最大距离为 1.0 (纯黑 L=0 -> 纯白 L=1)
+            score = min(100.0, distance * 100.0)
+            return score
+        except Exception as e:
+            # Fallback (手动计算 BGR 距离)
+            try:
+                t_bgr = np.array(bgr_txt[:3], dtype=np.float32)
+                b_bgr = np.array(bgr_bg[:3], dtype=np.float32)
+                return float(np.mean(np.abs(t_bgr - b_bgr)) / 2.55)
+            except:
+                return 0.0
 
     def _calc_perceptual_balance(self, img, saliency_mask):
         h, w = img.shape[:2]
@@ -814,6 +845,17 @@ class OmniVisualEngine:
         process_w = config.get('process_width', 512)
         custom_analysis_prompt = config.get('analysis_prompt')
 
+        # [Fix] Initialize legacy distribution variables to 0.0 to satisfy OmniReport dataclass requirements
+        d_count = 0
+        d_ent = 0.0
+        d_cv = 0.0
+        d_size_cv = 0.0
+        d_angle_ent = 0.0
+        
+        vis_dist_entropy = None
+        vis_dist_size = None
+        vis_dist_angle = None
+        
         # Variables Init
         vis_diag = image_input.copy(); vis_thirds = image_input.copy(); vis_balance = image_input.copy()
         score_diag = 0.0; score_thirds = 0.0; score_balance = 0.0
@@ -840,26 +882,23 @@ class OmniVisualEngine:
         text_content_ratio = 0.0
         vis_text_design = None
         
-        # Initialize PIL visualizer
-        vis_pil = Image.fromarray(cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB))
+        h, w = image_input.shape[:2]; scale = process_w / w; new_h = int(h * scale)
+        img_small = cv2.resize(image_input, (process_w, new_h))
+        img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB); img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+        
+        # Initialize PIL visualizer (needed for text drawing later)
+        # Use img_small to match OCR coordinate system
+        vis_pil = Image.fromarray(cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB))
         
         # Init color/texture vars
         warmth_ratio = 0.0; sat_mean = 0.0; bri_mean = 0.0
         cont_std = 0.0; clarity_ratio = 0.0; harmony_score = 0.0
         area_diff = 0.0; color_diff = 0.0; texture_diff = 0.0
-        avg_text_score = 0.0; avg_text_contrast = 0.0; text_content_str = "None"
+        avg_text_score = 0.0; text_content_str = "None"
         
         vis_edge_composite = None; vis_color_contrast = None; vis_text_final = None
         vis_warmth = None; vis_saturation = None; vis_brightness = None; vis_contrast = None; vis_clarity = None; vis_color_harmony = None
 
-        # Init old distribution variables to satisfy OmniReport dataclass, even if they are 0
-        d_count = 0; d_ent = 0.0; d_cv = 0.0; d_size_cv = 0.0; d_angle_ent = 0.0
-        vis_dist_entropy = None; vis_dist_size = None; vis_dist_angle = None
-
-        h, w = image_input.shape[:2]; scale = process_w / w; new_h = int(h * scale)
-        img_small = cv2.resize(image_input, (process_w, new_h))
-        img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB); img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
-        
         img_xyz = cv2.cvtColor(img_small, cv2.COLOR_BGR2XYZ).astype(np.float32); img_xyz_norm = img_xyz / 255.0 * 100.0
         cam_res = self.cam02.forward(img_xyz_norm); J, C, h_ang, M = cam_res['J'], cam_res['C'], cam_res['h'], cam_res['M']
         harmony_score, vis_harmony = self._analyze_color_harmony(h_ang, C, J, M, img_small)
@@ -960,7 +999,6 @@ class OmniVisualEngine:
             rad_h = np.radians(h_ang); a_cam = C * np.cos(rad_h); b_cam = C * np.sin(rad_h)
             m_fg_J = np.mean(J[binary_mask > 0]); m_fg_a = np.mean(a_cam[binary_mask > 0]); m_fg_b = np.mean(b_cam[binary_mask > 0])
             m_bg_J = np.mean(J[binary_mask_inv > 0]); m_bg_a = np.mean(a_cam[binary_mask_inv > 0]); m_bg_b = np.mean(b_cam[binary_mask_inv > 0])
-            color_diff = float(np.sqrt((m_fg_J - m_bg_J)**2 + (m_fg_a - m_bg_a)**2 + (m_fg_b - m_bg_b)**2))
             
             # [Optimization] 纹理对比算法
             kernel = np.ones((3, 3), np.uint8)
@@ -983,9 +1021,11 @@ class OmniVisualEngine:
             tex_bg = np.mean(magnitude[valid_bg > 0]) if cv2.countNonZero(valid_bg) > 0 else 0
             texture_diff = min(1.0, abs(tex_fg - tex_bg) / 50.0)
             
-            # [Fix] Normalized color_diff (0-100)
-            raw_color_diff = float(np.sqrt((m_fg_J - m_bg_J)**2 + (m_fg_a - m_bg_a)**2 + (m_fg_b - m_bg_b)**2))
-            color_diff = min(100.0, (raw_color_diff / 150.0) * 100.0)
+            # [New] Oklab for Figure-Ground Contrast
+            # Calculate mean BGR for FG and BG
+            m_fg_bgr = cv2.mean(img_small, mask=binary_mask)[:3]
+            m_bg_bgr = cv2.mean(img_small, mask=binary_mask_inv)[:3]
+            color_diff = self._calc_oklab_score(m_fg_bgr, m_bg_bgr)
 
             mag_clip = np.clip(magnitude, 0, np.percentile(magnitude, 95))
             mag_vis = cv2.normalize(mag_clip, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -1007,31 +1047,36 @@ class OmniVisualEngine:
              color_diff = 0.0; texture_diff = 0.0
              vis_edge_composite = None; vis_color_contrast = None
 
-        # Text Legibility Analysis
+        # Text Legibility Analysis (Now merged with Contrast)
         draw = ImageDraw.Draw(vis_pil); font = self._load_safe_font(16)
-        text_scores = []; text_contrasts = []; detected_texts = []
+        text_scores = []; detected_texts = []
         for (bbox, text_content, prob) in valid_ocr_items:
             detected_texts.append(text_content)
             pts = np.array(bbox, dtype=np.int32); bx, by, bw, bh = cv2.boundingRect(pts)
-            if w_box := min(bw, process_w - bx) < 5 or (h_box := min(bh, new_h - by)) < 5: continue
-            roi_g = img_gray[by:by+h_box, bx:bx+w_box]; roi_c = img_small[by:by+h_box, bx:bx+w_box]
+            # [Fix] Compute ROI sizes correctly, then check thresholds
+            w_box = min(bw, process_w - bx)
+            h_box = min(bh, new_h - by)
+            if w_box < 3 or h_box < 3: 
+                continue
+            
+            roi_g = img_gray[by:by+h_box, bx:bx+w_box]
+            roi_c = img_small[by:by+h_box, bx:bx+w_box]
             try:
                 _, t_mask = cv2.threshold(roi_g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 if cv2.countNonZero(t_mask) > (w_box * h_box * 0.6): t_mask = cv2.bitwise_not(t_mask)
-                m_txt = cv2.mean(roi_c, mask=t_mask)[:3]; m_bg = cv2.mean(roi_c, mask=cv2.bitwise_not(t_mask))[:3]
+                m_txt = cv2.mean(roi_c, mask=t_mask)
+                m_bg = cv2.mean(roi_c, mask=cv2.bitwise_not(t_mask))
                 
-                # Raw contrast (BGR Euclidean distance, max ~441.67)
-                raw_contrast = float(np.linalg.norm(np.array(m_txt) - np.array(m_bg)))
+                # [New] Oklab Contrast = Legibility Score
+                # Direct mapping: The Oklab distance (0-100) is the legibility score.
+                s_con = self._calc_oklab_score(m_txt, m_bg)
                 
-                # Calculate normalized legibility score (0-100)
-                # s_con used for legibility score
-                s_con = min(100, (raw_contrast / 441.67) * 100) 
+                # Optional: Add small bonus for size/confidence if needed, but keeping it pure is safer for "Contrast"
+                # Let's keep a slight mix to ensure tiny text with good contrast doesn't get 100% perfect legibility
+                # But since user said "Clarity and Contrast are same", we prioritize contrast.
+                item_score = s_con 
                 
-                item_score = 0.7 * s_con + 0.3 * 80 
                 text_scores.append(item_score); 
-                
-                # Store normalized contrast
-                text_contrasts.append(s_con)
                 
                 color = (0, 255, 0) if item_score > 60 else (255, 0, 0)
                 draw.rectangle([bx, by, bx+w_box, by+h_box], outline=color, width=2)
@@ -1041,7 +1086,6 @@ class OmniVisualEngine:
         vis_text_final = np.array(vis_pil)
         has_text = len(text_scores) > 0
         avg_text_score = float(np.mean(text_scores)) if has_text else 0.0
-        avg_text_contrast = float(np.mean(text_contrasts)) if has_text else 0.0
         text_content_str = " | ".join(detected_texts) if has_text else "None"
 
         return OmniReport(
@@ -1073,8 +1117,11 @@ class OmniVisualEngine:
             semantic_style=style_label, semantic_score=round(style_score, 1), 
             vlm_critique=vlm_critique, 
             fg_area_diff=round(area_diff, 2), fg_color_diff=round(color_diff, 1), fg_texture_diff=round(texture_diff, 3),
-            fg_text_present=has_text, fg_text_legibility=round(avg_text_score, 1),
-            fg_text_contrast=round(avg_text_contrast, 1), fg_text_content=text_content_str,
+            
+            # [Mod] Merged Text Fields
+            fg_text_present=has_text, 
+            fg_text_legibility=round(avg_text_score, 1),
+            fg_text_content=text_content_str,
             
             # Use initialized variables
             dist_count=int(d_count), dist_entropy=float(d_ent), dist_cv=float(d_cv),
@@ -1116,8 +1163,12 @@ class BenchmarkManager:
             'text_alignment_score': 'sigmoid',
             'text_hierarchy_score': 'sigmoid',
             'fg_text_legibility': 'sigmoid',
-            'fg_text_contrast': 'sigmoid', # [Add] New metric policy
+            # [Rem] fg_text_contrast removed
             
+            # [Fix] Change to gaussian for figure-ground differences (Range-is-Better)
+            'fg_color_diff': 'gaussian',
+            'fg_texture_diff': 'gaussian',
+
             'color_warmth': 'gaussian',
             'color_saturation': 'gaussian',
             'color_brightness': 'gaussian',
@@ -1125,34 +1176,33 @@ class BenchmarkManager:
             'comp_balance_score': 'gaussian',
             'comp_negative_space_score': 'gaussian',
             'fg_area_diff': 'gaussian',
-            'fg_color_diff': 'gaussian',
-            'fg_texture_diff': 'gaussian',
+            
             'text_content_ratio': 'gaussian',
             
             'comp_negative_entropy': 'penalty' 
         }
 
-    def _score_sigmoid(self, x, target, tolerance):
+    def _score_sigmoid(self, x, target, std):
         diff = x - target
         if diff >= 0:
             return 100.0
-        tol = max(1e-5, tolerance)
-        k = 4.0 / tol 
-        score = 100.0 / (1.0 + math.exp(-k * (diff + tol))) 
+        sigma = max(1e-5, std)
+        k = 4.0 / sigma
+        score = 100.0 / (1.0 + math.exp(-k * (diff + sigma))) 
         return min(100.0, max(0.0, score))
 
-    def _score_gaussian(self, x, target, tolerance):
-        if tolerance < 1e-5: tolerance = 1e-5
+    def _score_gaussian(self, x, target, std):
+        sigma = max(1e-5, std)
         delta = x - target
-        score = 100.0 * math.exp(-0.5 * (delta / tolerance) ** 2)
+        score = 100.0 * math.exp(-0.5 * (delta / sigma) ** 2)
         return min(100.0, max(0.0, score))
 
-    def _score_penalty(self, x, threshold, tolerance):
+    def _score_penalty(self, x, threshold, std):
         if x <= threshold:
             return 100.0
         diff = x - threshold
-        tol = max(1e-5, tolerance)
-        score = 100.0 * math.exp(-1.0 * (diff / tol))
+        sigma = max(1e-5, std)
+        score = 100.0 * math.exp(-1.0 * (diff / sigma))
         return min(100.0, max(0.0, score))
 
     def create_profile(self, reports: List[OmniReport]) -> Dict:
@@ -1168,34 +1218,34 @@ class BenchmarkManager:
                 val = getattr(r, k, 0)
                 if val is None: val = 0.0
                 
-                # [Fix] Only scale 0-1 metrics. fg_color_diff and fg_text_contrast are now pre-normalized.
+                # [Fix] Only scale 0-1 metrics. fg_color_diff is now pre-normalized.
                 if k in ['color_warmth', 'color_saturation', 'color_brightness', 'color_contrast', 'color_clarity', 
-                         'fg_area_diff', 'fg_texture_diff', 'text_content_ratio']:
-                     val = val * 100.0
-                elif k == 'comp_negative_entropy':
+                         'fg_area_diff', 'fg_texture_diff', 'comp_negative_entropy']:
                      val = val * 100.0
                 
-                if k in ['fg_text_legibility', 'fg_text_contrast'] and not getattr(r, 'fg_text_present', False):
+                if k in ['fg_text_legibility'] and not getattr(r, 'fg_text_present', False):
                     continue
                     
                 data_matrix[k].append(val)
         
         for k, values in data_matrix.items():
             if not values:
-                profile[k] = {'target': 0, 'tolerance': 10}
+                profile[k] = {'target': 0, 'std': 10}
                 continue
                 
             mean = float(np.mean(values))
             std = float(np.std(values))
             
-            tolerance = max(std * 1.5, 5.0) 
+            std = max(std, 5.0)
             
             if self.metric_policies[k] == 'penalty':
-                mean = mean + std 
+                target_val = mean + std 
+            else:
+                target_val = mean
             
             profile[k] = {
-                'target': mean,
-                'tolerance': tolerance
+                'target': target_val,
+                'std': std
             }
             
         return profile
@@ -1214,26 +1264,27 @@ class BenchmarkManager:
             val = getattr(data, k, 0)
             if val is None: val = 0.0
             
+            # Apply same scaling as in create_profile
             if k in ['color_warmth', 'color_saturation', 'color_brightness', 'color_contrast', 'color_clarity', 
-                     'fg_area_diff', 'fg_texture_diff', 'text_content_ratio', 'comp_negative_entropy']:
+                     'fg_area_diff', 'fg_texture_diff', 'comp_negative_entropy']:
                  val = val * 100.0
             
             if k not in profile: continue 
             
-            if k in ['fg_text_legibility', 'fg_text_contrast'] and not getattr(data, 'fg_text_present', False):
+            if k in ['fg_text_legibility'] and not getattr(data, 'fg_text_present', False):
                 details[k] = {'score': 0, 'actual': 0, 'target': 0, 'policy': policy}
                 continue
 
             target = profile[k]['target']
-            tolerance = profile[k].get('tolerance', 10.0)
+            std = profile[k].get('std', 10.0)
             weight = weights_config.get(k, 1.0)
             
             if policy == 'sigmoid':
-                item_score = self._score_sigmoid(val, target, tolerance)
+                item_score = self._score_sigmoid(val, target, std)
             elif policy == 'gaussian':
-                item_score = self._score_gaussian(val, target, tolerance)
+                item_score = self._score_gaussian(val, target, std)
             elif policy == 'penalty':
-                item_score = self._score_penalty(val, target, tolerance)
+                item_score = self._score_penalty(val, target, std)
             else:
                 item_score = 0.0
                 
@@ -1244,7 +1295,7 @@ class BenchmarkManager:
                 'score': round(item_score, 1),
                 'actual': round(val, 1),
                 'target': round(target, 1),
-                'tolerance': round(tolerance, 1),
+                'std': round(std, 1),
                 'weight': round(weight, 1),
                 'policy': policy
             }
