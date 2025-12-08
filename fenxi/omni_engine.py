@@ -134,7 +134,7 @@ class OmniReport:
     text_hierarchy_score: float
     text_content_ratio: float
 
-    # --- 分布 (Legacy but kept for compatibility) ---
+    # --- 分布 (Legacy) ---
     dist_count: int
     dist_entropy: float         
     dist_cv: float              
@@ -148,14 +148,14 @@ class OmniReport:
     vis_edge_bg: Optional[np.ndarray] = None
     vis_edge_composite: Optional[np.ndarray] = None
     vis_text_analysis: Optional[np.ndarray] = None
-    vis_text_design: Optional[np.ndarray] = None # 排版分析图
+    vis_text_design: Optional[np.ndarray] = None 
     
     vis_color_contrast: Optional[np.ndarray] = None
     vis_symmetry_heatmap: Optional[np.ndarray] = None
     
     vis_saliency_heatmap: Optional[np.ndarray] = None
-    vis_layout_template: Optional[np.ndarray] = None # Deprecated, use dict
-    vis_layout_dict: Optional[Dict] = None # New: Multi-template results
+    vis_layout_template: Optional[np.ndarray] = None # Legacy
+    vis_layout_dict: Optional[Dict] = None # New dict
     vis_visual_flow: Optional[np.ndarray] = None
     vis_visual_order: Optional[np.ndarray] = None
     
@@ -172,7 +172,7 @@ class OmniReport:
     vis_dist_size: Optional[np.ndarray] = None     
     vis_dist_angle: Optional[np.ndarray] = None
     
-    # Legacy placeholders
+    # Legacy placeholders with defaults
     composition_diagonal: float = 0.0
     composition_thirds: float = 0.0
     composition_balance: float = 0.0
@@ -206,12 +206,13 @@ class DoubaoVLMAnalyzer:
                 x1 = max(0, x - pad); y1 = max(0, y - pad)
                 x2 = min(w_img, x + w + pad); y2 = min(h_img, y + h + pad)
                 target_img = image_bgr[y1:y2, x1:x2]
-        
+
         base64_image = self._encode_image(target_img)
+        
         template = custom_prompt_template if custom_prompt_template and custom_prompt_template.strip() else DEFAULT_ANALYSIS_PROMPT
         try:
             system_prompt = template.format(context_str="这张图片")
-        except:
+        except Exception:
             system_prompt = template
 
         try:
@@ -281,13 +282,6 @@ class HybridSegmenter:
             print("⚠️ SAM 未加载，将仅使用 U2-Net 进行粗略分割。")
 
     def extract_main_subject_mask(self, image_bgr: np.ndarray, config: Dict = None, text_boxes: List = None) -> Tuple[np.ndarray, List]:
-        """
-        核心分割逻辑 (Robust Polygon Fill):
-        1. [Base]: U2-Net 二值化掩码。
-        2. [Refine]: SAM (Box 5% 膨胀)。
-        3. [Guarantee]: Box Coverage Check (15% 阈值)。
-        4. [Text]: 强制多边形填充 (Polygon Fill)。
-        """
         h, w = image_bgr.shape[:2]
         box_prompts = []
         debug_boxes = []
@@ -364,7 +358,7 @@ class HybridSegmenter:
                 if fill_ratio < 0.15:
                     cv2.rectangle(final_mask, (x1, y1), (x2, y2), 255, -1)
 
-        # 5. [Force] 强制叠加文字区域 (Simple Polygon Fill)
+        # 5. [Force] 强制叠加文字区域
         if text_boxes:
             for bbox in text_boxes:
                 pts = np.array(bbox, dtype=np.int32)
@@ -381,7 +375,7 @@ class HybridSegmenter:
 # === 全能视觉分析引擎 ===
 class OmniVisualEngine:
     def __init__(self, vlm_api_key=None, vlm_endpoint=None):
-        print("Initializing Omni Engine v18.0 (Final Complete)...")
+        print("Initializing Omni Engine v18.4 (Final Fix)...")
         self.ocr_type = 'easyocr'
         self.ocr_reader = None
         
@@ -429,7 +423,42 @@ class OmniVisualEngine:
                 output.append((points, item[1], item[2]))
             return output
 
-    # --- 构图与视觉分析辅助 ---
+    # --- Helpers ---
+    def _draw_dist_entropy_map(self, vis, grid_counts, w, h):
+        grid_size = grid_counts.shape[0]; step_x = w/grid_size; step_y = h/grid_size
+        max_c = np.max(grid_counts) if np.max(grid_counts) > 0 else 1
+        overlay = vis.copy()
+        for y in range(grid_size):
+            for x in range(grid_size):
+                count = grid_counts[y,x]
+                if count > 0:
+                    it = count/max_c; col = (int(255*(1-it)), 100, int(255*it)) 
+                    cv2.rectangle(overlay, (int(x*step_x),int(y*step_y)), (int((x+1)*step_x),int((x+1)*step_y)), col, -1)
+                    cv2.putText(overlay, str(int(count)), (int(x*step_x)+5, int(y*step_y)+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        return cv2.addWeighted(overlay, 0.6, vis, 0.4, 0)
+
+    def _draw_dist_size_map(self, vis, visual_elements, valid_contours):
+        vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
+        if not visual_elements: return vis
+        areas = [x['area'] for x in visual_elements]; max_area = max(areas) if areas else 1
+        for item, cnt in zip(visual_elements, valid_contours):
+            norm_size = item['area'] / max_area
+            b = int(255 * (1 - norm_size)); g = int(100 * (1 - abs(norm_size - 0.5)*2)); r = int(255 * norm_size)
+            cv2.drawContours(vis, [cnt], -1, (b, g, r), -1); cv2.drawContours(vis, [cnt], -1, (255,255,255), 1)
+            cx, cy = item['centroid']; cv2.putText(vis, f"S:{int(item['area'])}", (cx-20, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+        return vis
+
+    def _draw_dist_angle_map(self, vis, visual_elements, valid_contours):
+        vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
+        for item, cnt in zip(visual_elements, valid_contours):
+            cx, cy = item['centroid']; angle = item['angle']
+            cv2.drawContours(vis, [cnt], -1, (100,100,100), 1)
+            length = 40; rad = math.radians(angle)
+            end_x = int(cx + length * math.cos(rad)); end_y = int(cy + length * math.sin(rad))
+            cv2.line(vis, (cx, cy), (end_x, end_y), (0, 255, 255), 2); cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.putText(vis, f"{int(angle)}d", (cx+5, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        return vis
+
     def _calc_perceptual_balance(self, img, saliency_mask):
         h, w = img.shape[:2]
         center_x, center_y = w // 2, h // 2
@@ -449,7 +478,7 @@ class OmniVisualEngine:
         cv2.line(vis, (center_x, center_y), (cx, cy), (0, 255, 255), 2)
         return balance_score, (cx, cy), cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
-    def _match_composition_template(self, mask, w, h):
+    def _match_composition_template(self, mask, w, h, img_bg):
         best_iou = 0.0
         best_type = "Unknown"
         templates = {}
@@ -498,18 +527,17 @@ class OmniVisualEngine:
             intersection = np.logical_and(mask_bool, temp_bool).sum()
             union = np.logical_or(mask_bool, temp_bool).sum()
             iou = intersection / union if union > 0 else 0
-            
             score = min(100, iou * 100 * 1.5)
             vis = np.zeros((h, w, 3), dtype=np.uint8)
             vis[mask_bool] = (0, 0, 255)
             vis[temp_bool] = (0, 255, 0)
             vis[np.logical_and(mask_bool, temp_bool)] = (0, 255, 255) 
+            vis = cv2.addWeighted(img_bg, 0.5, vis, 0.5, 0)
+            cv2.putText(vis, f"{name}: {int(score)}", (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
             results[name] = {'score': score, 'vis': cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)}
-            
             if iou > best_iou:
                 best_iou = iou
                 best_type = name
-        
         score = min(100, best_iou * 100 * 1.5)
         return best_type, score, results
 
@@ -579,7 +607,87 @@ class OmniVisualEngine:
             score = 90.0 if in_mask else 40.0
         return score, vp, vis
 
-    # --- [NEW] 排版分析逻辑 ---
+    def _extract_visual_elements(self, image_bgr, binary_mask, ocr_raw, face_points, new_h, process_w):
+        visual_elements = []; valid_contours = []
+        min_graphic_area = max(10, (new_h * process_w) * 0.005); min_text_area = max(5, (new_h * process_w) * 0.002)
+        sub_contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        text_polys = []
+        for item in ocr_raw:
+            if len(item) >= 3 and item[2] > 0.01: 
+                text_polys.append(np.array(item[0], dtype=np.int32))
+
+        for cnt in sub_contours:
+            area = cv2.contourArea(cnt)
+            if area < min_graphic_area: continue
+            M = cv2.moments(cnt)
+            if M["m00"] <= 1e-5: continue
+            cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
+            is_text_overlap = False
+            for tp in text_polys:
+                if cv2.pointPolygonTest(tp, (cx, cy), False) >= 0:
+                    is_text_overlap = True
+                    break
+            if is_text_overlap: continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            mu20 = M['mu20']; mu02 = M['mu02']; mu11 = M['mu11']
+            theta = 0.5 * np.arctan2(2 * mu11, mu20 - mu02); angle_deg = math.degrees(theta)
+            if angle_deg < 0: angle_deg += 180
+            is_face = False
+            for fx, fy in face_points:
+                if cv2.pointPolygonTest(cnt, (fx, fy), True) > -20: cx, cy = fx, fy; is_face = True; break
+            visual_elements.append({
+                "type": "graphic", "centroid": (cx, cy), "bbox": (bx, by, bw, bh), "area": area * 2.0 if is_face else area, 
+                "angle": angle_deg, "color": (255, 0, 255) if is_face else (0, 0, 255), "contour": cnt 
+            }); valid_contours.append(cnt)
+            
+        for item in ocr_raw:
+            if len(item) >= 3 and item[2] > 0.01:
+                bbox, text, prob = item[0], item[1], item[2]
+                pts = np.array(bbox, dtype=np.int32); bx, by, bw, bh = cv2.boundingRect(pts)
+                M_txt = cv2.moments(pts)
+                if M_txt["m00"] <= 1e-5: continue
+                tcx = int(M_txt["m10"] / M_txt["m00"]); tcy = int(M_txt["m01"] / M_txt["m00"])
+                if cv2.contourArea(pts) < min_text_area: continue
+                rect = cv2.minAreaRect(pts); t_angle = rect[2]; 
+                if rect[1][0] < rect[1][1]: t_angle += 90
+                text_cnt = np.array([[[bx, by]], [[bx+bw, by]], [[bx+bw, by+bh]], [[bx, by+bh]]], dtype=np.int32)
+                visual_elements.append({
+                    "type": "text", "centroid": (tcx, tcy), "bbox": (bx, by, bw, bh), "area": cv2.contourArea(pts) * 2.5, 
+                    "angle": abs(t_angle) % 180, "color": (0, 165, 255), "contour": text_cnt
+                }); valid_contours.append(text_cnt)
+        return visual_elements, valid_contours
+
+    def _analyze_distribution(self, img_bgr, visual_elements, valid_contours):
+        h, w = img_bgr.shape[:2]; centroids = []; areas = []; angles = [] 
+        for item in visual_elements:
+            centroids.append(list(item['centroid'])); areas.append(item['area']); angles.append(item['angle']) 
+        num_objects = len(centroids); grid_size = 10; grid_counts = np.zeros((grid_size, grid_size))
+        norm_entropy = 0.0
+        if num_objects > 0:
+            for x, y in centroids:
+                grid_counts[min(int(y/h*grid_size), grid_size-1), min(int(x/w*grid_size), grid_size-1)] += 1
+            prob = grid_counts.flatten() / num_objects; prob_filtered = prob[prob > 0]
+            max_entropy = np.log(grid_size**2); norm_entropy = entropy(prob_filtered) / max_entropy if max_entropy > 0 else 0.0
+        spacing_cv = 0.0
+        if num_objects >= 2:
+            try:
+                points = np.array(centroids); tree = cKDTree(points); dists, _ = tree.query(points, k=2)
+                nearest = dists[:, 1]; mean_dist = np.mean(nearest)
+                spacing_cv = (np.std(nearest) / mean_dist) if mean_dist > 1e-5 else 0.0
+            except Exception: pass
+        size_cv = 0.0
+        if num_objects >= 2 and sum(areas) > 0:
+            mean_area = np.mean(areas)
+            if mean_area > 1e-5: size_cv = np.std(areas) / mean_area
+        angle_entropy = 0.0
+        if num_objects >= 2:
+            hist_angle, _ = np.histogram(angles, bins=18, range=(0, 180), density=True); hist_angle += 1e-10
+            angle_entropy = entropy(hist_angle) / np.log(18) if np.log(18) > 0 else 0.0
+        
+        visual_order_score = max(0, 100 * (1 - angle_entropy))
+        vis_visual_order = self._draw_dist_angle_map(img_bgr.copy(), visual_elements, valid_contours)
+        return num_objects, visual_order_score, cv2.cvtColor(vis_visual_order, cv2.COLOR_BGR2RGB)
+
     def _analyze_text_layout(self, valid_ocr_items, w, h):
         if not valid_ocr_items:
             return 0.0, 0.0, 0.0, None
@@ -638,129 +746,6 @@ class OmniVisualEngine:
             hierarchy_score = min(100, cv_h * 200)
             
         return alignment_score, hierarchy_score, text_content_ratio, cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-
-    def _extract_visual_elements(self, image_bgr, binary_mask, ocr_raw, face_points, new_h, process_w):
-        visual_elements = []; valid_contours = []
-        min_graphic_area = max(10, (new_h * process_w) * 0.005)
-        min_text_area = max(5, (new_h * process_w) * 0.002)
-        sub_contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        text_polys = []
-        for item in ocr_raw:
-            if len(item) >= 3 and item[2] > 0.01: text_polys.append(np.array(item[0], dtype=np.int32))
-
-        for cnt in sub_contours:
-            area = cv2.contourArea(cnt)
-            if area < min_graphic_area: continue
-            M = cv2.moments(cnt)
-            if M["m00"] <= 1e-5: continue
-            cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
-            is_text_overlap = False
-            for tp in text_polys:
-                if cv2.pointPolygonTest(tp, (cx, cy), False) >= 0:
-                    is_text_overlap = True; break
-            if is_text_overlap: continue
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            mu20 = M['mu20']; mu02 = M['mu02']; mu11 = M['mu11']
-            theta = 0.5 * np.arctan2(2 * mu11, mu20 - mu02); angle_deg = math.degrees(theta)
-            if angle_deg < 0: angle_deg += 180
-            is_face = False
-            for fx, fy in face_points:
-                if cv2.pointPolygonTest(cnt, (fx, fy), True) > -20: cx, cy = fx, fy; is_face = True; break
-            visual_elements.append({
-                "type": "graphic", "centroid": (cx, cy), "bbox": (bx, by, bw, bh), "area": area * 2.0 if is_face else area, 
-                "angle": angle_deg, "color": (255, 0, 255) if is_face else (0, 0, 255), "contour": cnt 
-            }); valid_contours.append(cnt)
-            
-        for item in ocr_raw:
-            if len(item) >= 3 and item[2] > 0.01:
-                bbox, text, prob = item[0], item[1], item[2]
-                pts = np.array(bbox, dtype=np.int32); bx, by, bw, bh = cv2.boundingRect(pts)
-                M_txt = cv2.moments(pts)
-                if M_txt["m00"] <= 1e-5: continue
-                tcx = int(M_txt["m10"] / M_txt["m00"]); tcy = int(M_txt["m01"] / M_txt["m00"])
-                if cv2.contourArea(pts) < min_text_area: continue
-                rect = cv2.minAreaRect(pts); t_angle = rect[2]; 
-                if rect[1][0] < rect[1][1]: t_angle += 90
-                text_cnt = np.array([[[bx, by]], [[bx+bw, by]], [[bx+bw, by+bh]], [[bx, by+bh]]], dtype=np.int32)
-                visual_elements.append({
-                    "type": "text", "centroid": (tcx, tcy), "bbox": (bx, by, bw, bh), "area": cv2.contourArea(pts) * 2.5, 
-                    "angle": abs(t_angle) % 180, "color": (0, 165, 255), "contour": text_cnt
-                }); valid_contours.append(text_cnt)
-        return visual_elements, valid_contours
-
-    def _draw_dist_entropy_map(self, vis, grid_counts, w, h):
-        grid_size = grid_counts.shape[0]; step_x = w/grid_size; step_y = h/grid_size
-        max_c = np.max(grid_counts) if np.max(grid_counts) > 0 else 1
-        overlay = vis.copy()
-        for y in range(grid_size):
-            for x in range(grid_size):
-                count = grid_counts[y,x]
-                if count > 0:
-                    it = count/max_c; col = (int(255*(1-it)), 100, int(255*it)) 
-                    cv2.rectangle(overlay, (int(x*step_x),int(y*step_y)), (int((x+1)*step_x),int((x+1)*step_y)), col, -1)
-                    cv2.putText(overlay, str(int(count)), (int(x*step_x)+5, int(y*step_y)+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-        return cv2.addWeighted(overlay, 0.6, vis, 0.4, 0)
-
-    def _draw_dist_size_map(self, vis, visual_elements, valid_contours):
-        vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
-        if not visual_elements: return vis
-        areas = [x['area'] for x in visual_elements]; max_area = max(areas) if areas else 1
-        for item, cnt in zip(visual_elements, valid_contours):
-            norm_size = item['area'] / max_area
-            b = int(255 * (1 - norm_size)); g = int(100 * (1 - abs(norm_size - 0.5)*2)); r = int(255 * norm_size)
-            cv2.drawContours(vis, [cnt], -1, (b, g, r), -1); cv2.drawContours(vis, [cnt], -1, (255,255,255), 1)
-            cx, cy = item['centroid']; cv2.putText(vis, f"S:{int(item['area'])}", (cx-20, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-        return vis
-
-    def _draw_dist_angle_map(self, vis, visual_elements, valid_contours):
-        vis = cv2.addWeighted(vis, 0.3, np.zeros_like(vis), 0.7, 0)
-        for item, cnt in zip(visual_elements, valid_contours):
-            cx, cy = item['centroid']; angle = item['angle']
-            cv2.drawContours(vis, [cnt], -1, (100,100,100), 1)
-            length = 40; rad = math.radians(angle)
-            end_x = int(cx + length * math.cos(rad)); end_y = int(cy + length * math.sin(rad))
-            cv2.line(vis, (cx, cy), (end_x, end_y), (0, 255, 255), 2); cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
-            cv2.putText(vis, f"{int(angle)}d", (cx+5, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-        return vis
-
-    def _analyze_distribution(self, img_bgr, visual_elements, valid_contours):
-        h, w = img_bgr.shape[:2]; centroids = []; areas = []; angles = [] 
-        for item in visual_elements:
-            centroids.append(list(item['centroid'])); areas.append(item['area']); angles.append(item['angle']) 
-        num_objects = len(centroids); grid_size = 10; grid_counts = np.zeros((grid_size, grid_size))
-        
-        norm_entropy = 0.0
-        if num_objects > 0:
-            for x, y in centroids:
-                grid_counts[min(int(y/h*grid_size), grid_size-1), min(int(x/w*grid_size), grid_size-1)] += 1
-            prob = grid_counts.flatten() / num_objects; prob_filtered = prob[prob > 0]
-            max_entropy = np.log(grid_size**2); norm_entropy = entropy(prob_filtered) / max_entropy if max_entropy > 0 else 0.0
-        
-        spacing_cv = 0.0
-        if num_objects >= 2:
-            try:
-                points = np.array(centroids); tree = cKDTree(points); dists, _ = tree.query(points, k=2)
-                nearest = dists[:, 1]; mean_dist = np.mean(nearest)
-                spacing_cv = (np.std(nearest) / mean_dist) if mean_dist > 1e-5 else 0.0
-            except Exception: pass
-
-        size_cv = 0.0
-        if num_objects >= 2 and sum(areas) > 0:
-            mean_area = np.mean(areas)
-            if mean_area > 1e-5: size_cv = np.std(areas) / mean_area
-
-        angle_entropy = 0.0
-        if num_objects >= 2:
-            hist_angle, _ = np.histogram(angles, bins=18, range=(0, 180), density=True); hist_angle += 1e-10
-            angle_entropy = entropy(hist_angle) / np.log(18) if np.log(18) > 0 else 0.0
-
-        vis_dist_entropy = self._draw_dist_entropy_map(img_bgr.copy(), grid_counts, w, h)
-        vis_dist_size = self._draw_dist_size_map(img_bgr.copy(), visual_elements, valid_contours)
-        vis_dist_angle = self._draw_dist_angle_map(img_bgr.copy(), visual_elements, valid_contours)
-        
-        # New Visual Order Metric
-        visual_order_score = max(0, 100 * (1 - angle_entropy))
-        return num_objects, visual_order_score, cv2.cvtColor(vis_dist_angle, cv2.COLOR_BGR2RGB)
 
     def _analyze_kobayashi_image_scale(self, h_map, C_map, J_map, M_map):
         mask = (C_map > 5) & (J_map > 10) & (J_map < 98)
@@ -829,7 +814,7 @@ class OmniVisualEngine:
         process_w = config.get('process_width', 512)
         custom_analysis_prompt = config.get('analysis_prompt')
 
-        # [Initialization] Initialize all variables at the top
+        # Variables Init
         vis_diag = image_input.copy(); vis_thirds = image_input.copy(); vis_balance = image_input.copy()
         score_diag = 0.0; score_thirds = 0.0; score_balance = 0.0
         score_symmetry = 0.0; vis_symmetry_heatmap = None
@@ -848,23 +833,15 @@ class OmniVisualEngine:
         vis_visual_flow = image_input.copy()
         vis_visual_order = image_input.copy() # Init
         visual_order_score = 0.0 # Init
-
-        # Init old distribution variables
-        d_count = 0; d_ent = 0.0; d_cv = 0.0; d_size_cv = 0.0; d_angle_ent = 0.0
-        vis_dist_entropy = None; vis_dist_size = None; vis_dist_angle = None
         
         # New text vars
         text_alignment_score = 0.0
         text_hierarchy_score = 0.0
         text_content_ratio = 0.0
         vis_text_design = None
-
-        h, w = image_input.shape[:2]; scale = process_w / w; new_h = int(h * scale)
-        img_small = cv2.resize(image_input, (process_w, new_h))
-        img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB); img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         
-        # Initialize PIL visualizer (needed for text drawing later)
-        vis_pil = Image.fromarray(img_rgb)
+        # Initialize PIL visualizer
+        vis_pil = Image.fromarray(cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB))
         
         # Init color/texture vars
         warmth_ratio = 0.0; sat_mean = 0.0; bri_mean = 0.0
@@ -874,6 +851,14 @@ class OmniVisualEngine:
         
         vis_edge_composite = None; vis_color_contrast = None; vis_text_final = None
         vis_warmth = None; vis_saturation = None; vis_brightness = None; vis_contrast = None; vis_clarity = None; vis_color_harmony = None
+
+        # Init old distribution variables to satisfy OmniReport dataclass, even if they are 0
+        d_count = 0; d_ent = 0.0; d_cv = 0.0; d_size_cv = 0.0; d_angle_ent = 0.0
+        vis_dist_entropy = None; vis_dist_size = None; vis_dist_angle = None
+
+        h, w = image_input.shape[:2]; scale = process_w / w; new_h = int(h * scale)
+        img_small = cv2.resize(image_input, (process_w, new_h))
+        img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB); img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         
         img_xyz = cv2.cvtColor(img_small, cv2.COLOR_BGR2XYZ).astype(np.float32); img_xyz_norm = img_xyz / 255.0 * 100.0
         cam_res = self.cam02.forward(img_xyz_norm); J, C, h_ang, M = cam_res['J'], cam_res['C'], cam_res['h'], cam_res['M']
@@ -924,9 +909,9 @@ class OmniVisualEngine:
         cv2.drawContours(all_elements_mask, dist_contours, -1, 255, -1)
         
         d_count_new, visual_order_score, vis_visual_order = self._analyze_distribution(img_small, visual_elements, dist_contours)
-        d_count = d_count_new
+        d_count = d_count_new 
         
-        # [Text Layout Analysis]
+        # [NEW] Text Layout Analysis
         text_alignment_score, text_hierarchy_score, text_content_ratio, vis_text_design = self._analyze_text_layout(valid_ocr_items, process_w, new_h)
         
         # --- 构图分析 ---
@@ -941,8 +926,8 @@ class OmniVisualEngine:
         
         comp_balance_score, comp_balance_center, vis_saliency_heatmap = self._calc_perceptual_balance(img_small, saliency_vis)
         
-        # [Composition Template Matching] Returns dict of all matches
-        comp_layout_type, comp_layout_score, vis_layout_dict = self._match_composition_template(binary_mask, process_w, new_h)
+        # [Update] Capture dict from match_composition_template
+        comp_layout_type, comp_layout_score, vis_layout_dict = self._match_composition_template(binary_mask, process_w, new_h, img_small)
         
         comp_negative_space_score, comp_negative_entropy = self._analyze_negative_space(binary_mask_inv)
         comp_visual_flow_score, comp_vanishing_point, vis_visual_flow = self._analyze_visual_flow(img_gray, binary_mask)
@@ -997,6 +982,10 @@ class OmniVisualEngine:
             tex_fg = np.mean(magnitude[valid_fg > 0]) if cv2.countNonZero(valid_fg) > 0 else 0
             tex_bg = np.mean(magnitude[valid_bg > 0]) if cv2.countNonZero(valid_bg) > 0 else 0
             texture_diff = min(1.0, abs(tex_fg - tex_bg) / 50.0)
+            
+            # [Fix] Normalized color_diff (0-100)
+            raw_color_diff = float(np.sqrt((m_fg_J - m_bg_J)**2 + (m_fg_a - m_bg_a)**2 + (m_fg_b - m_bg_b)**2))
+            color_diff = min(100.0, (raw_color_diff / 150.0) * 100.0)
 
             mag_clip = np.clip(magnitude, 0, np.percentile(magnitude, 95))
             mag_vis = cv2.normalize(mag_clip, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -1030,9 +1019,20 @@ class OmniVisualEngine:
                 _, t_mask = cv2.threshold(roi_g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 if cv2.countNonZero(t_mask) > (w_box * h_box * 0.6): t_mask = cv2.bitwise_not(t_mask)
                 m_txt = cv2.mean(roi_c, mask=t_mask)[:3]; m_bg = cv2.mean(roi_c, mask=cv2.bitwise_not(t_mask))[:3]
-                contrast = float(np.linalg.norm(np.array(m_txt) - np.array(m_bg)))
-                s_con = min(100, contrast); item_score = 0.7 * s_con + 0.3 * 80 
-                text_scores.append(item_score); text_contrasts.append(contrast)
+                
+                # Raw contrast (BGR Euclidean distance, max ~441.67)
+                raw_contrast = float(np.linalg.norm(np.array(m_txt) - np.array(m_bg)))
+                
+                # Calculate normalized legibility score (0-100)
+                # s_con used for legibility score
+                s_con = min(100, (raw_contrast / 441.67) * 100) 
+                
+                item_score = 0.7 * s_con + 0.3 * 80 
+                text_scores.append(item_score); 
+                
+                # Store normalized contrast
+                text_contrasts.append(s_con)
+                
                 color = (0, 255, 0) if item_score > 60 else (255, 0, 0)
                 draw.rectangle([bx, by, bx+w_box, by+h_box], outline=color, width=2)
                 draw.text((bx, by), f"S:{int(item_score)}", fill=(255, 255, 255), font=font)
@@ -1059,7 +1059,8 @@ class OmniVisualEngine:
             text_alignment_score=round(text_alignment_score, 1),
             text_hierarchy_score=round(text_hierarchy_score, 1),
             text_content_ratio=round(text_content_ratio, 1),
-
+            
+            # Legacy fields - init with 0 or dummy
             composition_diagonal=0.0, 
             composition_thirds=0.0,
             composition_balance=0.0,
@@ -1075,10 +1076,12 @@ class OmniVisualEngine:
             fg_text_present=has_text, fg_text_legibility=round(avg_text_score, 1),
             fg_text_contrast=round(avg_text_contrast, 1), fg_text_content=text_content_str,
             
+            # Use initialized variables
             dist_count=int(d_count), dist_entropy=float(d_ent), dist_cv=float(d_cv),
             dist_size_cv=float(d_size_cv), dist_angle_entropy=float(d_angle_ent),
             
             vis_mask=vis_mask_debug, vis_all_elements=all_elements_mask,
+            # Use initialized or calculated visualization variables
             vis_dist_entropy=vis_dist_entropy, vis_dist_size=vis_dist_size, vis_dist_angle=vis_dist_angle,
             
             vis_edge_fg=vis_edge_composite, vis_edge_bg=vis_edge_composite, vis_edge_composite=vis_edge_composite,
@@ -1089,7 +1092,7 @@ class OmniVisualEngine:
             vis_brightness=vis_brightness, vis_contrast=vis_contrast, vis_color_harmony=vis_harmony,
             
             vis_saliency_heatmap=vis_saliency_heatmap,
-            vis_layout_template=vis_layout_template,
+            vis_layout_template=None,
             vis_layout_dict=vis_layout_dict,
             vis_visual_flow=vis_visual_flow,
             vis_visual_order=vis_visual_order,
@@ -1102,4 +1105,160 @@ class AestheticDiagnostician:
         return {"total_score": data.semantic_score if data.semantic_score > 0 else 75.0, "rating_level": "Good"}
 
 class BenchmarkManager:
-    def __init__(self): pass
+    def __init__(self):
+        # 定义每个指标的评分策略
+        self.metric_policies = {
+            'color_clarity': 'sigmoid',
+            'color_harmony': 'sigmoid',
+            'comp_layout_score': 'sigmoid',
+            'comp_visual_flow_score': 'sigmoid',
+            'comp_visual_order_score': 'sigmoid',
+            'text_alignment_score': 'sigmoid',
+            'text_hierarchy_score': 'sigmoid',
+            'fg_text_legibility': 'sigmoid',
+            'fg_text_contrast': 'sigmoid', # [Add] New metric policy
+            
+            'color_warmth': 'gaussian',
+            'color_saturation': 'gaussian',
+            'color_brightness': 'gaussian',
+            'color_contrast': 'gaussian',
+            'comp_balance_score': 'gaussian',
+            'comp_negative_space_score': 'gaussian',
+            'fg_area_diff': 'gaussian',
+            'fg_color_diff': 'gaussian',
+            'fg_texture_diff': 'gaussian',
+            'text_content_ratio': 'gaussian',
+            
+            'comp_negative_entropy': 'penalty' 
+        }
+
+    def _score_sigmoid(self, x, target, tolerance):
+        diff = x - target
+        if diff >= 0:
+            return 100.0
+        tol = max(1e-5, tolerance)
+        k = 4.0 / tol 
+        score = 100.0 / (1.0 + math.exp(-k * (diff + tol))) 
+        return min(100.0, max(0.0, score))
+
+    def _score_gaussian(self, x, target, tolerance):
+        if tolerance < 1e-5: tolerance = 1e-5
+        delta = x - target
+        score = 100.0 * math.exp(-0.5 * (delta / tolerance) ** 2)
+        return min(100.0, max(0.0, score))
+
+    def _score_penalty(self, x, threshold, tolerance):
+        if x <= threshold:
+            return 100.0
+        diff = x - threshold
+        tol = max(1e-5, tolerance)
+        score = 100.0 * math.exp(-1.0 * (diff / tol))
+        return min(100.0, max(0.0, score))
+
+    def create_profile(self, reports: List[OmniReport]) -> Dict:
+        if not reports: return {}
+        
+        profile = {}
+        all_keys = self.metric_policies.keys()
+        
+        data_matrix = {k: [] for k in all_keys}
+        
+        for r in reports:
+            for k in all_keys:
+                val = getattr(r, k, 0)
+                if val is None: val = 0.0
+                
+                # [Fix] Only scale 0-1 metrics. fg_color_diff and fg_text_contrast are now pre-normalized.
+                if k in ['color_warmth', 'color_saturation', 'color_brightness', 'color_contrast', 'color_clarity', 
+                         'fg_area_diff', 'fg_texture_diff', 'text_content_ratio']:
+                     val = val * 100.0
+                elif k == 'comp_negative_entropy':
+                     val = val * 100.0
+                
+                if k in ['fg_text_legibility', 'fg_text_contrast'] and not getattr(r, 'fg_text_present', False):
+                    continue
+                    
+                data_matrix[k].append(val)
+        
+        for k, values in data_matrix.items():
+            if not values:
+                profile[k] = {'target': 0, 'tolerance': 10}
+                continue
+                
+            mean = float(np.mean(values))
+            std = float(np.std(values))
+            
+            tolerance = max(std * 1.5, 5.0) 
+            
+            if self.metric_policies[k] == 'penalty':
+                mean = mean + std 
+            
+            profile[k] = {
+                'target': mean,
+                'tolerance': tolerance
+            }
+            
+        return profile
+
+    def score_against_benchmark(self, data: OmniReport, profile: Dict) -> Dict:
+        if not profile:
+            return {"total_score": 0, "rating_level": "N/A", "details": {}}
+        
+        total_score = 0.0
+        total_weight = 0.0
+        details = {}
+        
+        weights_config = profile.get('weights', {})
+        
+        for k, policy in self.metric_policies.items():
+            val = getattr(data, k, 0)
+            if val is None: val = 0.0
+            
+            if k in ['color_warmth', 'color_saturation', 'color_brightness', 'color_contrast', 'color_clarity', 
+                     'fg_area_diff', 'fg_texture_diff', 'text_content_ratio', 'comp_negative_entropy']:
+                 val = val * 100.0
+            
+            if k not in profile: continue 
+            
+            if k in ['fg_text_legibility', 'fg_text_contrast'] and not getattr(data, 'fg_text_present', False):
+                details[k] = {'score': 0, 'actual': 0, 'target': 0, 'policy': policy}
+                continue
+
+            target = profile[k]['target']
+            tolerance = profile[k].get('tolerance', 10.0)
+            weight = weights_config.get(k, 1.0)
+            
+            if policy == 'sigmoid':
+                item_score = self._score_sigmoid(val, target, tolerance)
+            elif policy == 'gaussian':
+                item_score = self._score_gaussian(val, target, tolerance)
+            elif policy == 'penalty':
+                item_score = self._score_penalty(val, target, tolerance)
+            else:
+                item_score = 0.0
+                
+            total_score += item_score * weight
+            total_weight += weight
+            
+            details[k] = {
+                'score': round(item_score, 1),
+                'actual': round(val, 1),
+                'target': round(target, 1),
+                'tolerance': round(tolerance, 1),
+                'weight': round(weight, 1),
+                'policy': policy
+            }
+            
+        final_score = total_score / total_weight if total_weight > 0 else 0
+        
+        if final_score >= 90: rating = "S (卓越)"
+        elif final_score >= 80: rating = "A (优秀)"
+        elif final_score >= 70: rating = "B (良好)"
+        elif final_score >= 60: rating = "C (合格)"
+        else: rating = "D (不合格)"
+        
+        return {
+            "total_score": round(final_score, 1), 
+            "rating_level": rating, 
+            "details": details
+        }

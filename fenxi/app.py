@@ -23,7 +23,7 @@ except ImportError as e:
 # ==========================================
 # 1. 页面基础配置
 # ==========================================
-st.set_page_config(page_title="全能视觉分析 Pro (V18.0 Interactive Layout)", layout="wide", page_icon="🧿")
+st.set_page_config(page_title="全能视觉分析 Pro (V18.3 Import Fix)", layout="wide", page_icon="🧿")
 
 st.markdown("""
     <style>
@@ -108,7 +108,7 @@ with st.sidebar:
         else:
             st.warning("⚠️ 未配置 VLM: 将跳过 AI 点评环节")
 
-    # [New] 提示词工程区域 (简化版)
+    # 提示词工程区域
     with st.expander("📝 提示词工程 (Prompt Engineering)", expanded=True):
         st.markdown("**美学分析指令 (System Prompt)**")
         st.caption("定义 VLM 如何评价图片。使用 `{context_str}` 代表图片主体。")
@@ -165,7 +165,7 @@ with st.sidebar:
         ]
         dims_text = [
             ('text_alignment_score', '排版对齐'), ('text_hierarchy_score', '层级性'),
-            ('text_content_ratio', '内容占比'), ('fg_text_legibility', '易读性')
+            ('text_content_ratio', '内容占比'), ('fg_text_legibility', '易读性'), ('fg_text_contrast', '文字对比')
         ]
         dims_content = [('fg_color_diff', '主体色差'), ('fg_area_diff', '主体占比'), ('fg_texture_diff', '纹理差异')]
         
@@ -208,19 +208,17 @@ with st.sidebar:
             render_sliders(tab_t, "🅰️ 文字排版", dims_text, False)
             render_sliders(tab_t, "🌗 图底", dims_content, False)
 
-    # [Updated] 将自定义提示词打包进 Config
     config = {
         'process_width': p_width, 'seg_kmeans_k': k_num, 'comp_diag_slope': t_diag,
         'comp_sym_blur_k': t_sym_blur, 'fg_tex_norm': ref_tex, 'color_clarity_thresh': t_clarity,
         'comp_thirds_slope': 0.2, 'comp_sym_tolerance': 120.0, 'text_score_thresh': 60.0,
         'weights': final_weights, 'tolerances': final_tols,
-        'analysis_prompt': st.session_state.analysis_prompt    # 传递给后端
+        'analysis_prompt': st.session_state.analysis_prompt
     }
 
-# 初始化引擎 (带 Key)
+# 初始化引擎
 @st.cache_resource
-def get_engine(api_key, endpoint, _version="v18.0_layout_switch"):
-    # 传入 API Key，_version 用于强制刷新缓存
+def get_engine(api_key, endpoint, _version="v18.3_no_circular"):
     return OmniVisualEngine(vlm_api_key=api_key, vlm_endpoint=endpoint)
 
 engine = get_engine(vlm_key, vlm_endpoint)
@@ -271,8 +269,7 @@ def normalize_values(source, is_profile=False):
         
         get('color_warmth')*100, get('color_saturation')*100, get('color_brightness')*100, min(100, (get('color_contrast')/0.3)*100), get('color_clarity')*100, get('color_harmony'),
         
-        # New text dimensions
-        get('text_alignment_score'), get('text_hierarchy_score'), min(100, get('text_content_ratio') * 2), get('fg_text_legibility'),
+        get('text_alignment_score'), get('text_hierarchy_score'), min(100, get('text_content_ratio') * 2), get('fg_text_legibility'), get('fg_text_contrast'),
         
         get('fg_area_diff')*100, min(100, get('fg_color_diff')), get('fg_texture_diff')*100
     ]
@@ -281,6 +278,13 @@ def normalize_values(source, is_profile=False):
 # 5. 批量处理逻辑
 # ==========================================
 def run_batch_process(files, cfg, need_zip, profile=None):
+    # [Lazy Import Fix]
+    try:
+        from benchmark_service import BenchmarkTrainer
+    except ImportError:
+        st.error("无法加载标杆服务，请检查文件完整性。")
+        return
+
     st.session_state.processing = True
     st.session_state.batch_logs = []
     
@@ -288,14 +292,11 @@ def run_batch_process(files, cfg, need_zip, profile=None):
         ('comp_balance_score', '构图_感知平衡'), ('comp_layout_score', '构图_模板匹配'),
         ('comp_negative_space_score', '构图_呼吸感'), ('comp_visual_flow_score', '构图_视线引导'),
         ('comp_visual_order_score', '构图_视觉秩序'),
-        
         ('color_saturation', '色彩_饱和度'), ('color_brightness', '色彩_亮度'),
         ('color_warmth', '色彩_暖色调'), ('color_contrast', '色彩_对比度'),
         ('color_clarity', '色彩_清晰度'), ('color_harmony', '色彩_和谐度'),
-        
         ('text_alignment_score', '文字_排版对齐'), ('text_hierarchy_score', '文字_层级性'),
-        ('text_content_ratio', '文字_内容占比'), ('fg_text_legibility', '文字_易读性'),
-        
+        ('text_content_ratio', '文字_内容占比'), ('fg_text_legibility', '文字_易读性'), ('fg_text_contrast', '文字_对比度'),
         ('fg_color_diff', '图底_色差'), ('fg_area_diff', '图底_占比'), ('fg_texture_diff', '图底_纹理差')
     ]
     
@@ -331,7 +332,8 @@ def run_batch_process(files, cfg, need_zip, profile=None):
             raw_obj = {k: make_serializable(getattr(d, k)) for k, _ in ALL_DIMS_MAPPING}; raw_obj['filename'] = f.name; raw_json_list.append(raw_obj)
             if zf:
                 vis_map = {
-                    'v_balance': 'vis_saliency_heatmap', 'v_flow': 'vis_visual_flow', 'v_order': 'vis_visual_order',
+                    'v_balance': 'vis_saliency_heatmap', 'v_layout': 'vis_layout_template', 
+                    'v_flow': 'vis_visual_flow', 'v_order': 'vis_visual_order',
                     'v_sat': 'vis_saturation', 'v_bri': 'vis_brightness', 'v_text_leg': 'vis_text_analysis', 'v_text_lay': 'vis_text_design',
                     'v_col_harm': 'vis_color_harmony'
                 }
@@ -438,7 +440,7 @@ elif mode == "📸 单图诊断":
             g_r1_1, g_r1_2, g_r1_3 = st.columns(3)
             smart_card(g_r1_1, "感知平衡", "comp_balance_score")
             
-            # 动态显示最佳匹配构图类型
+            # [New] Interactive Composition Template Switcher
             layout_str = getattr(data, 'comp_layout_type', 'N/A')
             smart_card(g_r1_2, f"构图匹配 ({layout_str})", "comp_layout_score")
             
@@ -447,11 +449,16 @@ elif mode == "📸 单图诊断":
             smart_card(g_r2_1, "呼吸感", "comp_negative_space_score")
             smart_card(g_r2_2, "视线引导", "comp_visual_flow_score")
 
-            st.divider(); st.caption("🅰️ 文字排版 (4项)")
+            st.divider(); st.caption("🅰️ 文字排版 (5项)")
             t_r1_1, t_r1_2 = st.columns(2); smart_card(t_r1_1, "排版对齐", "text_alignment_score"); smart_card(t_r1_2, "层级性", "text_hierarchy_score")
-            t_r2_1, t_r2_2 = st.columns(2); smart_card(t_r2_1, "内容占比", "text_content_ratio", "%"); 
-            if getattr(data, 'fg_text_present', False): smart_card(t_r2_2, "易读性", "fg_text_legibility")
-            else: t_r2_2.metric("易读性", "N/A", "无显著文字")
+            t_r2_1, t_r2_2, t_r2_3 = st.columns(3); 
+            smart_card(t_r2_1, "内容占比", "text_content_ratio", "%"); 
+            if getattr(data, 'fg_text_present', False): 
+                smart_card(t_r2_2, "易读性", "fg_text_legibility")
+                smart_card(t_r2_3, "文字对比", "fg_text_contrast")
+            else: 
+                t_r2_2.metric("易读性", "N/A", "无显著文字")
+                t_r2_3.metric("文字对比", "N/A", "无显著文字")
 
             st.divider(); st.caption("🌗 图底与信息 (3项)")
             f_r1_1, f_r1_2, f_r1_3 = st.columns(3)
@@ -460,8 +467,8 @@ elif mode == "📸 单图诊断":
             smart_card(f_r1_3, "纹理差异", "fg_texture_diff")
             
         with c2:
-            st.subheader("📊 维度雷达 (17核心)")
-            cats = ['感知平衡','构图匹配','呼吸感','视线引导', '视觉秩序', '暖色','饱和','亮度','对比','清晰','和谐', '排版对齐', '层级', '内容比', '易读', '占比', '色差']
+            st.subheader("📊 维度雷达 (19核心)")
+            cats = ['感知平衡','构图匹配','呼吸感','视线引导', '视觉秩序', '暖色','饱和','亮度','对比','清晰','和谐', '排版对齐', '层级', '内容比', '易读', '文字对比', '占比', '色差', '纹理']
             vals = normalize_values(data, False); fig = go.Figure()
             fig.add_trace(go.Scatterpolar(r=vals, theta=cats, fill='toself', name='当前图片', line_color='#3498db'))
             if is_bench:
@@ -515,3 +522,75 @@ elif mode == "📸 单图诊断":
                 c1, c2 = st.columns(2)
                 if data.vis_text_analysis is not None: c1.image(data.vis_text_analysis, caption="易读性分析", use_container_width=True)
                 if data.vis_text_design is not None: c2.image(data.vis_text_design, caption="排版分析 (对齐/层级)", use_container_width=True)
+
+# --- 模式 3: 建立标杆 (Restored) --- 
+elif mode == "🏆 建立标杆":
+    st.title("🏆 建立行业视觉标杆")
+    
+    # [New] 增加标杆加载功能
+    with st.expander("📂 加载已有标杆配置 (Load Profile)", expanded=False):
+        uploaded_profile = st.file_uploader("上传 benchmark_profile.json", type=["json"], key="profile_loader")
+        if uploaded_profile is not None:
+            try:
+                loaded_data = json.load(uploaded_profile)
+                # 简单校验
+                if 'weights' in loaded_data and 'tolerances' in loaded_data:
+                    if st.button("确认加载此配置", type="primary"):
+                        st.session_state.benchmark_profile = loaded_data
+                        st.success("✅ 标杆配置已加载！侧边栏权重与参数已更新。")
+                        time.sleep(1)
+                        st.rerun()
+                else:
+                    st.warning("⚠️ JSON 格式不符合标杆配置文件规范 (缺少 weights 或 tolerances 字段)")
+            except Exception as e:
+                st.error(f"无法解析文件: {e}")
+
+    st.divider()
+
+    c_high, c_low = st.columns(2)
+    with c_high: files_high = st.file_uploader("High (正向)", accept_multiple_files=True)
+    with c_low: files_low = st.file_uploader("Low (负向)", accept_multiple_files=True)
+    
+    if files_high and st.button("🚀 开始训练"):
+        # [Lazy Import] 
+        try:
+            from benchmark_service import BenchmarkTrainer
+        except ImportError:
+            st.error("无法导入 benchmark_service")
+            st.stop()
+            
+        trainer = BenchmarkTrainer()
+        gc.collect()
+        with st.spinner("Training..."):
+            try:
+                # [Update] Handle dict return from train
+                profile, dist_data_dict, stats = trainer.train(files_high, files_low, config)
+                st.session_state.benchmark_profile = profile
+                st.success(f"训练完成！(正向:{stats['pos_count']}, 负向:{stats['neg_count']})")
+                
+                with st.expander("📈 特征分布可视化 (正向 vs 负向)", expanded=True): 
+                    tab_pos, tab_neg = st.tabs(["🟢 正向样本分布", "🔴 负向样本分布"])
+                    
+                    with tab_pos:
+                        fig_pos = go.Figure() 
+                        # Use dist_data_dict['pos']
+                        for k, vals in dist_data_dict['pos'].items(): 
+                            fig_pos.add_trace(go.Box(y=vals, name=k, boxpoints='all', jitter=0.3, marker_color='green')) 
+                        fig_pos.update_layout(height=400, showlegend=False, title="正向标杆特征分布 (0-100)") 
+                        st.plotly_chart(fig_pos, use_container_width=True)
+                    
+                    with tab_neg:
+                        # Use dist_data_dict['neg']
+                        if dist_data_dict.get('neg'):
+                            fig_neg = go.Figure() 
+                            for k, vals in dist_data_dict['neg'].items(): 
+                                fig_neg.add_trace(go.Box(y=vals, name=k, boxpoints='all', jitter=0.3, marker_color='red')) 
+                            fig_neg.update_layout(height=400, showlegend=False, title="负向样本特征分布 (0-100)") 
+                            st.plotly_chart(fig_neg, use_container_width=True)
+                        else:
+                            st.info("未上传负向样本，无法生成对比分布图。")
+                
+                json_str = json.dumps(profile, default=make_serializable, indent=4) 
+                st.download_button("📦 下载完整配置", json_str, "benchmark_profile.json", "application/json", type="primary")
+            except Exception as e:
+                st.error(f"训练失败: {str(e)}")
