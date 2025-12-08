@@ -25,3 +25,7 @@ env/
 # Build artifacts
 dist/
 build/
+
+# Model weights and binaries
+*.pth
+sam_vit_b_01ec64.pth
