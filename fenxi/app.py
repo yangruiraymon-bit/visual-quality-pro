@@ -24,7 +24,7 @@ except ImportError as e:
 # ==========================================
 # 1. 页面基础配置
 # ==========================================
-st.set_page_config(page_title="全能视觉分析 Pro (V25.0 Oklab Edition)", layout="wide", page_icon="🧿")
+st.set_page_config(page_title="全能视觉分析 Pro (V25.0 VLM Recognition)", layout="wide", page_icon="🧿")
 
 st.markdown("""
     <style>
@@ -62,10 +62,10 @@ if 'analysis_prompt' not in st.session_state: st.session_state.analysis_prompt =
 # ==========================================
 with st.sidebar:
     st.header("🧿 视觉分析 Pro")
-    st.caption("内核: SAM + U2-Net + Oklab + VLM")
+    st.caption("内核: VLM (主体/文字识别) + Oklab + CIECAM02")
     
     # VLM 配置
-    with st.expander("🧠 视觉大模型 (VLM) 配置", expanded=False):
+    with st.expander("🧠 视觉大模型 (VLM) 配置", expanded=True):
         _cfg_path = os.path.expanduser("~/.fenxi_vlm.json")
         def _load_vlm():
             try:
@@ -103,24 +103,31 @@ with st.sidebar:
                 st.rerun()
         
         if vlm_key:
-            st.success("✅ VLM 已就绪 (仅用于美学点评)")
+            st.success("✅ VLM 已就绪 (用于核心识别)")
         else:
-            st.warning("⚠️ 未配置 VLM: 将跳过 AI 点评环节")
+            st.error("⛔ 未配置 VLM: 主体与文字识别将不可用")
 
-    # [New] 提示词工程区域 (简化版)
-    with st.expander("📝 提示词工程 (Prompt Engineering)", expanded=True):
-        st.markdown("**美学分析指令 (System Prompt)**")
-        st.caption("定义 VLM 如何评价图片。使用 `{context_str}` 代表图片主体。")
+    # [Updated] 提示词工程区域 (适配新版识别逻辑)
+    with st.expander("📝 提示词配置 (Prompt Config)", expanded=True):
+        st.markdown("**VLM 识别指令 (System Prompt)**")
+        st.caption("定义 VLM 如何识别画面主体与文字。需严格保持 JSON 输出格式。")
+        
         ana_prompt_input = st.text_area(
             "Prompt 内容", 
             value=st.session_state.analysis_prompt, 
-            height=200,
-            key="ana_prompt_area"
+            height=300,
+            key="ana_prompt_area",
+            help="修改此指令可调整 VLM 对主体和文字的识别偏好。"
         )
         
-        if st.button("💾 保存提示词配置", type="primary", use_container_width=True):
+        c_p1, c_p2 = st.columns(2)
+        if c_p1.button("💾 保存配置", type="primary", use_container_width=True):
             st.session_state.analysis_prompt = ana_prompt_input
-            st.success("提示词已更新！下一次分析将生效。")
+            st.success("已更新！")
+            
+        if c_p2.button("🔄 重置默认", use_container_width=True):
+            st.session_state.analysis_prompt = DEFAULT_ANALYSIS_PROMPT
+            st.rerun()
 
     # 模式选择
     mode = st.radio("工作模式", ["📸 单图诊断", "📦 批量工厂", "🏆 建立标杆"], index=0)
@@ -157,7 +164,7 @@ with st.sidebar:
         ref_tex = st.slider("纹理基准", 10.0, 100.0, 50.0)
         t_clarity = st.slider("高光/清晰阈值", 0.5, 0.9, 0.7)
     
-    # 权重容差 (18个指标 - 移除文字对比度)
+    # 权重容差
     with st.expander("⚖️ 评分权重配置", expanded=False):
         dims_geo = [
             ('comp_balance_score', '感知平衡'), ('comp_layout_score', '构图匹配'), 
@@ -202,11 +209,9 @@ with st.sidebar:
         'analysis_prompt': st.session_state.analysis_prompt    # 传递给后端
     }
 
-# 初始化引擎 (带 Key)
-# [Fix] Update version string to force cache reload of OmniVisualEngine
+# 初始化引擎
 @st.cache_resource
-def get_engine(api_key, endpoint, _version="v25.0_oklab_merged"):
-    # 传入 API Key，_version 用于强制刷新缓存
+def get_engine(api_key, endpoint, _version="v25.0_vlm_rec"):
     return OmniVisualEngine(vlm_api_key=api_key, vlm_endpoint=endpoint)
 
 engine = get_engine(vlm_key, vlm_endpoint)
@@ -257,46 +262,29 @@ def normalize_values(source, is_profile=False):
         
         get('color_warmth')*100, get('color_saturation')*100, get('color_brightness')*100, min(100, (get('color_contrast')/0.3)*100), get('color_clarity')*100, get('color_harmony'),
         
-        # New text dimensions (Removed contrast)
         get('text_alignment_score'), get('text_hierarchy_score'), min(100, get('text_content_ratio') * 2), get('fg_text_legibility'),
         
         get('fg_area_diff')*100, min(100, get('fg_color_diff')), get('fg_texture_diff')*100
     ]
 
-# [New] 流形可视化函数
 def plot_aesthetic_manifold(manifold, current_vector=None):
     if not manifold or not manifold.is_fitted: return None
-    
     vis_data = manifold.get_visualization_data()
     fig = go.Figure()
-    
-    # 1. 绘制标杆流形 (绿色点云)
     fig.add_trace(go.Scatter(
-        x=vis_data['x'], y=vis_data['y'],
-        mode='markers',
+        x=vis_data['x'], y=vis_data['y'], mode='markers',
         marker=dict(size=8, color='rgba(46, 204, 113, 0.6)', line=dict(width=1, color='DarkSlateGrey')),
-        text=vis_data['filenames'],
-        name='标杆正向样本'
+        text=vis_data['filenames'], name='标杆正向样本'
     ))
-    
-    # 2. 绘制当前图片落点 (红色星号)
     if current_vector is not None:
         _, _, curr_coord = manifold.evaluate(current_vector)
         fig.add_trace(go.Scatter(
-            x=[curr_coord[0]], y=[curr_coord[1]],
-            mode='markers',
-            marker=dict(size=15, color='red', symbol='star'),
-            name='当前图片'
+            x=[curr_coord[0]], y=[curr_coord[1]], mode='markers',
+            marker=dict(size=15, color='red', symbol='star'), name='当前图片'
         ))
-        
     fig.update_layout(
-        title="🌌 动态美学流形 (PCA 2D Projection)",
-        xaxis_title="Feature Dimension 1",
-        yaxis_title="Feature Dimension 2",
-        showlegend=True,
-        height=400,
-        margin=dict(l=20, r=20, t=40, b=20),
-        plot_bgcolor="rgba(240,242,246,0.5)"
+        title="🌌 动态美学流形 (PCA 2D Projection)", xaxis_title="Feature Dim 1", yaxis_title="Feature Dim 2",
+        showlegend=True, height=400, margin=dict(l=20, r=20, t=40, b=20), plot_bgcolor="rgba(240,242,246,0.5)"
     )
     return fig
 
@@ -306,23 +294,17 @@ def plot_aesthetic_manifold(manifold, current_vector=None):
 def run_batch_process(files, cfg, need_zip, profile=None):
     st.session_state.processing = True
     st.session_state.batch_logs = []
-    
     ALL_DIMS_MAPPING = [
         ('comp_balance_score', '构图_感知平衡'), ('comp_layout_score', '构图_模板匹配'),
         ('comp_negative_space_score', '构图_呼吸感'), ('comp_visual_flow_score', '构图_视线引导'),
         ('comp_visual_order_score', '构图_视觉秩序'),
-        
         ('color_saturation', '色彩_饱和度'), ('color_brightness', '色彩_亮度'),
         ('color_warmth', '色彩_暖色调'), ('color_contrast', '色彩_对比度'),
         ('color_clarity', '色彩_清晰度'), ('color_harmony', '色彩_和谐度'),
-        
         ('text_alignment_score', '文字_排版对齐'), ('text_hierarchy_score', '文字_层级性'),
         ('text_content_ratio', '文字_内容占比'), ('fg_text_legibility', '文字_易读性'), 
-        # ('fg_text_contrast', '文字_对比度'), [Rem] Merged
-        
         ('fg_color_diff', '图底_色差'), ('fg_area_diff', '图底_占比'), ('fg_texture_diff', '图底_纹理差')
     ]
-    
     rows = []; diff_rows = []; raw_json_list = []
     zip_buffer = io.BytesIO() if need_zip else None
     zf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) if need_zip else None
@@ -422,7 +404,6 @@ elif mode == "📸 单图诊断":
             st.image(image_pil, use_container_width=True)
             st.metric("🏆 综合得分", f"{final_score:.1f}", delta=f"{final_rating} ({mode_display})")
             
-            # [Fixed] Always Show Breakdown if available
             with st.expander("📊 评分构成", expanded=True):
                 sc1, sc2, sc3 = st.columns(3)
                 if penalty_info:
@@ -447,15 +428,18 @@ elif mode == "📸 单图诊断":
                 if penalty_info and penalty_info.get('neighbors'):
                     st.caption(f"相似标杆: {', '.join(penalty_info['neighbors'][:3])}")
             
-            # [New] 展示 VLM 语义结果
-            st.subheader("🧠 AI 视觉顾问")
-            if hasattr(data, 'semantic_style') and data.semantic_style and data.semantic_style != "N/A":
-                st.info(f"🎨 **风格**: {data.semantic_style} (Score: {data.semantic_score})")
-                st.markdown(f"> 📝 **点评**: {data.vlm_critique}")
-            elif not vlm_key:
-                st.warning("未配置 VLM API Key，无法展示语义点评。")
+            # [Updated] 展示 VLM 识别状态，替代原有的点评
+            if vlm_key:
+                with st.expander("🤖 VLM 识别状态", expanded=False):
+                    st.success("VLM 调用成功")
+                    if getattr(data, 'fg_text_present', False):
+                        st.write(f"📝 **识别文字**: {data.fg_text_content}")
+                    else:
+                        st.write("📝 **识别文字**: 无")
+            else:
+                st.warning("VLM 未配置，识别功能受限")
 
-            # Smart Cards - 恢复 18 个指标 (文字对比度合并)
+            # Smart Cards
             def smart_card(col, label, key, unit="", multiplier=1.0):
                 raw_val = getattr(data, key, 0) or 0
                 if is_bench and key in bench_details:
@@ -491,7 +475,6 @@ elif mode == "📸 单图诊断":
             
         with c2:
             st.subheader("📊 维度雷达 (18核心)")
-            # Removed Text Contrast from cats
             cats = ['感知平衡','构图匹配','呼吸感','视线引导', '视觉秩序', '暖色','饱和','亮度','对比','清晰','和谐', '排版对齐', '层级', '内容比', '易读', '占比', '色差', '纹理']
             vals = normalize_values(data, False); fig = go.Figure()
             fig.add_trace(go.Scatterpolar(r=vals, theta=cats, fill='toself', name='当前图片', line_color='#3498db'))
@@ -521,13 +504,13 @@ elif mode == "📸 单图诊断":
                 if data.vis_clarity is not None: c4.image(data.vis_clarity, caption="清晰度/高光", use_container_width=True)
             with t_fg:
                 c1, c2 = st.columns(2)
-                if data.vis_mask is not None: c1.image(data.vis_mask, caption="智能分割", use_container_width=True)
+                if data.vis_mask is not None: c1.image(data.vis_mask, caption="智能分割 (VLM+SAM)", use_container_width=True)
                 if data.vis_color_contrast is not None: c2.image(data.vis_color_contrast, caption="色彩对比", use_container_width=True)
                 c3, c4 = st.columns(2)
                 if data.vis_edge_composite is not None: c3.image(data.vis_edge_composite, caption="纹理对比", use_container_width=True)
             with t_text:
                 c1, c2 = st.columns(2)
-                if data.vis_text_analysis is not None: c1.image(data.vis_text_analysis, caption="易读性分析", use_container_width=True)
+                if data.vis_text_analysis is not None: c1.image(data.vis_text_analysis, caption="易读性分析 (VLM OCR)", use_container_width=True)
                 if data.vis_text_design is not None: c2.image(data.vis_text_design, caption="排版分析", use_container_width=True)
 
 # --- 模式 3: 建立标杆 --- 

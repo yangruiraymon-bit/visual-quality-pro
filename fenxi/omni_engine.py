@@ -1,10 +1,9 @@
 import cv2
 import numpy as np
 import colour
-import easyocr
 from PIL import Image, ImageDraw, ImageFont
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Union, Any
 import platform
 import os
 from scipy.spatial import cKDTree
@@ -12,6 +11,7 @@ from scipy.stats import entropy
 import math
 import base64
 import json
+import re
 
 # === 引入依赖库 ===
 try:
@@ -30,25 +30,17 @@ except ImportError:
     VLM_AVAILABLE = False
     print("⚠️ 'openai' library not installed. VLM features disabled.")
 
-# PaddleOCR check
-try:
-    from paddleocr import PaddleOCR
-    PADDLE_AVAILABLE = True
-except ImportError:
-    PADDLE_AVAILABLE = False
-    print("⚠️ 未检测到 PaddleOCR。建议 'pip install paddlepaddle paddleocr' 以提升中文艺术字识别能力。")
-
 # ==========================================
-# 0. 提示词模板
+# 0. 提示词模板 (适配 Grounding 格式)
 # ==========================================
-DEFAULT_ANALYSIS_PROMPT = """你是一位资深的视觉美学总监。请分析{context_str}，并以严格的 JSON 格式返回结果。
-JSON 结构如下：
-{
-    "style": "简短的风格定义 (如: 极简主义/赛博朋克/日系清新/工业风)",
-    "score": 0-100之间的整数评分 (基于构图、色彩、光影、质感的专业评估),
-    "critique": "一句话的专业点评，指出优点或改进点 (30字以内)"
-}
-不要输出任何 Markdown 标记，仅输出 JSON 字符串。"""
+DEFAULT_ANALYSIS_PROMPT = """请检测图像中所有属于 "main_subject（视觉主体）、text（文字区域）" 类别的物体。
+对于每个物体，请提供其类别、边界框，如果是文字请提供内容（content）。
+格式为 JSON 列表：
+[
+  {{"category": "main_subject", "bbox": "<bbox>x1 y1 x2 y2</bbox>"}},
+  {{"category": "text", "bbox": "<bbox>x1 y1 x2 y2</bbox>", "content": "文字内容"}}
+]
+坐标 x1 y1 x2 y2 为 0-1000 的归一化整数，顺序为 左 上 右 下。"""
 
 # === Model Registry ===
 class ModelRegistry:
@@ -127,9 +119,8 @@ class OmniReport:
     fg_texture_diff: float
     
     # --- 文字排版 (4) ---
-    # [Mod] Merged Contrast into Legibility
     fg_text_present: bool
-    fg_text_legibility: float  # Now represents both clarity and contrast
+    fg_text_legibility: float
     fg_text_content: str
     text_alignment_score: float
     text_hierarchy_score: float
@@ -155,8 +146,8 @@ class OmniReport:
     vis_symmetry_heatmap: Optional[np.ndarray] = None
     
     vis_saliency_heatmap: Optional[np.ndarray] = None
-    vis_layout_template: Optional[np.ndarray] = None # Legacy
-    vis_layout_dict: Optional[Dict] = None # New dict
+    vis_layout_template: Optional[np.ndarray] = None 
+    vis_layout_dict: Optional[Dict] = None 
     vis_visual_flow: Optional[np.ndarray] = None
     vis_visual_order: Optional[np.ndarray] = None
     
@@ -173,14 +164,12 @@ class OmniReport:
     vis_dist_size: Optional[np.ndarray] = None     
     vis_dist_angle: Optional[np.ndarray] = None
     
-    # Legacy placeholders
     composition_diagonal: float = 0.0
     composition_thirds: float = 0.0
     composition_balance: float = 0.0
     composition_symmetry: float = 0.0
     
     def to_feature_vector(self) -> np.ndarray:
-        # [Mod] Reduced to 18 dimensions (removed fg_text_contrast)
         return np.array([
             self.comp_balance_score, self.comp_layout_score, self.comp_negative_space_score, 
             self.comp_visual_flow_score, self.comp_visual_order_score,
@@ -206,23 +195,15 @@ class DoubaoVLMAnalyzer:
         _, buffer = cv2.imencode('.jpg', image_bgr)
         return base64.b64encode(buffer).decode('utf-8')
 
-    def analyze(self, image_bgr, subject_mask=None, custom_prompt_template=None):
+    def analyze(self, image_bgr, custom_prompt_template=None):
         if not self.client:
-            return "未配置API", 0.0, "请在侧边栏配置豆包 API Key 和 Endpoint ID"
+            return None
 
-        target_img = image_bgr
-        if subject_mask is not None and cv2.countNonZero(subject_mask) > 0:
-            x, y, w, h = cv2.boundingRect(subject_mask)
-            if w > 10 and h > 10:
-                pad = 10
-                h_img, w_img = image_bgr.shape[:2]
-                x1 = max(0, x - pad); y1 = max(0, y - pad)
-                x2 = min(w_img, x + w + pad); y2 = min(h_img, y + h + pad)
-                target_img = image_bgr[y1:y2, x1:x2]
-
-        base64_image = self._encode_image(target_img)
+        base64_image = self._encode_image(image_bgr)
+        h, w = image_bgr.shape[:2]
         
         template = custom_prompt_template if custom_prompt_template and custom_prompt_template.strip() else DEFAULT_ANALYSIS_PROMPT
+        
         try:
             system_prompt = template.format(context_str="这张图片")
         except Exception:
@@ -235,17 +216,104 @@ class DoubaoVLMAnalyzer:
                     {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
-                        "content": [{"type": "text", "text": "请进行专业美学分析。"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}],
+                        "content": [{"type": "text", "text": "开始检测。"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}],
                     },
                 ],
+                extra_body={
+                    "reasoning_config": {
+                        "mode": "disabled"
+                    }
+                }
             )
             content = response.choices[0].message.content
             content = content.replace("```json", "").replace("```", "").strip()
-            result = json.loads(content)
-            return result.get("style", "未知"), float(result.get("score", 0)), result.get("critique", "解析失败")
+            
+            result_list = []
+            try:
+                match = re.search(r'(\[.*\]|\{.*\})', content, re.DOTALL)
+                if match:
+                    json_str = match.group(1)
+                    parsed = json.loads(json_str)
+                    if isinstance(parsed, list):
+                        result_list = parsed
+                    elif isinstance(parsed, dict):
+                        if "objects" in parsed and isinstance(parsed["objects"], list):
+                            result_list = parsed["objects"]
+                        elif "text_regions" in parsed and isinstance(parsed["text_regions"], list):
+                             result_list = parsed.get("text_regions", [])
+                             if "subject_rect_1000" in parsed:
+                                 result_list.append({"category": "main_subject", "bbox": parsed["subject_rect_1000"]})
+                        else:
+                            result_list = [parsed]
+                else:
+                    print("DEBUG: No JSON structure found in VLM response.")
+                    return None
+            except json.JSONDecodeError as e:
+                print(f"DEBUG: VLM JSON Decode Error: {e}")
+                return None
+
+            def parse_bbox_token(bbox_input: Union[str, List, Tuple]):
+                if bbox_input is None: return None
+                
+                nums = []
+                if isinstance(bbox_input, (list, tuple)):
+                    flat = []
+                    for x in bbox_input:
+                        if isinstance(x, (int, float)): flat.append(x)
+                        elif isinstance(x, str) and x.isdigit(): flat.append(int(x))
+                    nums = flat
+                elif isinstance(bbox_input, str):
+                    nums = list(map(int, re.findall(r'\d+', bbox_input)))
+                
+                if len(nums) >= 4:
+                    x1, y1, x2, y2 = nums[:4]
+                    if x1 > x2: x1, x2 = x2, x1
+                    if y1 > y2: y1, y2 = y2, y1
+                    return [
+                        int(x1 / 1000 * w), int(y1 / 1000 * h),
+                        int(x2 / 1000 * w), int(y2 / 1000 * h)
+                    ]
+                return None
+
+            vlm_data = {
+                "subject_box": None,
+                "text_items": []
+            }
+            
+            for item in result_list:
+                if not isinstance(item, dict): continue
+                
+                category = str(item.get("category", "")).lower()
+                bbox_raw = item.get("bbox") or item.get("rect_1000") or item.get("box")
+                
+                box_px = parse_bbox_token(bbox_raw)
+                if not box_px: continue
+                
+                x1, y1, x2, y2 = box_px
+                final_box = [x1, y1, x2, y2]
+
+                if any(k in category for k in ["main_subject", "subject", "主体", "object"]):
+                    if vlm_data["subject_box"] is None:
+                        vlm_data["subject_box"] = final_box
+                    else:
+                        curr_area = (final_box[2]-final_box[0]) * (final_box[3]-final_box[1])
+                        prev_area = (vlm_data["subject_box"][2]-vlm_data["subject_box"][0]) * (vlm_data["subject_box"][3]-vlm_data["subject_box"][1])
+                        if curr_area > prev_area:
+                            vlm_data["subject_box"] = final_box
+                
+                content = item.get("content", "")
+                is_text_cat = any(k in category for k in ["text", "ocr", "文字", "content"])
+                
+                if is_text_cat or (content and len(content) > 0):
+                    poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                    if not content: content = "Text"
+                    vlm_data["text_items"].append((poly, content, 1.0))
+
+            return vlm_data
+
         except Exception as e:
             print(f"VLM Analysis Error: {e}")
-            return "API错误", 0.0, f"调用失败: {str(e)}"
+            return None
 
 # === CIECAM02 向量化实现 ===
 class CIECAM02_Vectorized:
@@ -294,24 +362,50 @@ class HybridSegmenter:
         if not self.sam_predictor:
             print("⚠️ SAM 未加载，将仅使用 U2-Net 进行粗略分割。")
 
-    def extract_main_subject_mask(self, image_bgr: np.ndarray, config: Dict = None, text_boxes: List = None) -> Tuple[np.ndarray, List]:
+    def extract_main_subject_mask(self, image_bgr: np.ndarray, config: Dict = None, text_boxes: List = None, vlm_box_prompt: List = None) -> Tuple[np.ndarray, List]:
+        """
+        Modified: 
+        1. VLM box is the primary source.
+        2. 'box_prompts' (used for SAM/calculation) includes padding.
+        3. 'debug_boxes' (used for visualization) stores the RAW box to align with visual expectations.
+        """
         h, w = image_bgr.shape[:2]
         box_prompts = []
         debug_boxes = []
         final_mask = np.zeros((h, w), dtype=np.uint8)
-        EXPAND_RATIO = 0.05
         
-        def add_box_with_padding(x1, y1, x2, y2, label_type):
+        # Helper to handle distinct calculation vs display boxes
+        def add_box_with_distinct_display(raw_box, label_type, padding_ratio=0.0):
+            x1, y1, x2, y2 = raw_box
             bw = x2 - x1; bh = y2 - y1
-            pad_x = int(bw * EXPAND_RATIO); pad_y = int(bh * EXPAND_RATIO)
-            nx1 = max(0, x1 - pad_x); ny1 = max(0, y1 - pad_y)
-            nx2 = min(w, x2 + pad_x); ny2 = min(h, y2 + pad_y)
-            if nx2 > nx1 and ny2 > ny1:
-                box_prompts.append([nx1, ny1, nx2, ny2])
-                debug_boxes.append({'box': [nx1, ny1, nx2-nx1, ny2-nx1], 'type': label_type})
+            
+            # 1. Calc Padded Box (for SAM / Masking)
+            pad_x = int(bw * padding_ratio); pad_y = int(bh * padding_ratio)
+            px1 = max(0, x1 - pad_x); py1 = max(0, y1 - pad_y)
+            px2 = min(w, x2 + pad_x); py2 = min(h, y2 + pad_y)
+            
+            if px2 > px1 and py2 > py1:
+                # Store Padded for Calculation
+                box_prompts.append([px1, py1, px2, py2])
+                # Store Raw for Display (Visualization)
+                debug_boxes.append({'box': [x1, y1, bw, bh], 'type': label_type})
 
-        # 1. U2-Net
-        if self.u2net_session:
+        # 1. [PRIMARY] VLM Guidance (Subject)
+        #    - Calculation: Pad 2.5% (0.025) as requested
+        #    - Display: Show Raw box to match VLM output
+        if vlm_box_prompt is not None:
+            vx1, vy1, vx2, vy2 = vlm_box_prompt
+            if vx2 > vx1 and vy2 > vy1:
+                add_box_with_distinct_display(vlm_box_prompt, 'vlm_subject', padding_ratio=0.025)
+                
+                # Fallback: If SAM missing, draw the PADDED box as mask (best guess for segmentation)
+                if not self.sam_predictor:
+                    # Retrieve the last padded box we just added
+                    px1, py1, px2, py2 = box_prompts[-1]
+                    cv2.rectangle(final_mask, (px1, py1), (px2, py2), 255, -1)
+        
+        # 2. [FALLBACK] U2-Net
+        elif self.u2net_session:
             try:
                 img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
                 saliency_mask_pil = remove(Image.fromarray(img_rgb), session=self.u2net_session, only_mask=True)
@@ -323,57 +417,47 @@ class HybridSegmenter:
                 for cnt in contours:
                     if cv2.contourArea(cnt) > min_area:
                         x, y, bw, bh = cv2.boundingRect(cnt)
-                        add_box_with_padding(x, y, x + bw, y + bh, 'object')
+                        # U2Net is imprecise, use default 5% padding
+                        add_box_with_distinct_display([x, y, x+bw, y+bh], 'object_u2net', padding_ratio=0.05)
                         cv2.drawContours(u2net_valid_mask, [cnt], -1, 255, -1)
                 final_mask = cv2.bitwise_or(final_mask, u2net_valid_mask)
             except Exception: pass
 
-        # Fallback
-        if not box_prompts and cv2.countNonZero(final_mask) == 0:
-             saliency_mask = self._fallback_saliency(image_bgr)
-             _, thresh = cv2.threshold(saliency_mask, 100, 255, cv2.THRESH_BINARY)
-             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-             contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
-             for cnt in contours:
-                 x, y, bw, bh = cv2.boundingRect(cnt)
-                 add_box_with_padding(x, y, x + bw, y + bh, 'fallback')
-                 cv2.drawContours(final_mask, [cnt], -1, 255, -1)
-
-        # 2. OCR Text Boxes
+        # 3. Text Boxes
+        #    - Calculation: No padding (0.0) to strictly segment text area
+        #    - Display: Raw box
         if text_boxes:
             for bbox in text_boxes:
                 pts = np.array(bbox, dtype=np.int32)
                 x, y, bw, bh = cv2.boundingRect(pts)
                 if bw > 2 and bh > 2:
-                    add_box_with_padding(x, y, x + bw, y + bh, 'text')
+                    add_box_with_distinct_display([x, y, x+bw, y+bh], 'text', padding_ratio=0.0)
 
-        # 3. SAM
+        # 4. SAM Refinement
         if self.sam_predictor and box_prompts:
             try:
                 self.sam_predictor.set_image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-                for box in box_prompts:
+                for i, box in enumerate(box_prompts):
                     input_box = np.array(box)
                     masks, _, _ = self.sam_predictor.predict(point_coords=None, point_labels=None, box=input_box[None, :], multimask_output=False)
                     mask_uint8 = (masks[0] * 255).astype(np.uint8)
-                    final_mask = cv2.bitwise_or(final_mask, mask_uint8)
-            except Exception: pass
-        
-        # 4. Box Coverage Guarantee
-        for box in box_prompts:
-            x1, y1, x2, y2 = box
-            mask_roi = final_mask[y1:y2, x1:x2]
-            box_area = (x2 - x1) * (y2 - y1)
-            if box_area > 0:
-                fill_ratio = cv2.countNonZero(mask_roi) / box_area
-                if fill_ratio < 0.15:
-                    cv2.rectangle(final_mask, (x1, y1), (x2, y2), 255, -1)
+                    
+                    # [Logic] Clip mask to the PADDED box to prevent bleeding into far background
+                    # Since 'box' here IS the padded box, this ensures mask stays within the search area
+                    px1, py1, px2, py2 = box
+                    box_mask = np.zeros_like(mask_uint8)
+                    cv2.rectangle(box_mask, (px1, py1), (px2, py2), 255, -1)
+                    mask_uint8 = cv2.bitwise_and(mask_uint8, box_mask)
+                    
+                    # Guard: If SAM returned empty, use the box itself
+                    if cv2.countNonZero(mask_uint8) == 0:
+                         mask_uint8 = box_mask
 
-        # 5. [Force] 强制叠加文字区域 (Simple Polygon Fill)
-        if text_boxes:
-            for bbox in text_boxes:
-                pts = np.array(bbox, dtype=np.int32)
-                cv2.fillPoly(final_mask, [pts], 255)
-            
+                    final_mask = cv2.bitwise_or(final_mask, mask_uint8)
+            except Exception as e: 
+                print(f"SAM Error: {e}")
+                pass
+        
         return final_mask, debug_boxes
 
     def _fallback_saliency(self, img):
@@ -385,20 +469,7 @@ class HybridSegmenter:
 # === 全能视觉分析引擎 ===
 class OmniVisualEngine:
     def __init__(self, vlm_api_key=None, vlm_endpoint=None):
-        print("Initializing Omni Engine v25.0 (Oklab+Merged)...")
-        self.ocr_type = 'easyocr'
-        self.ocr_reader = None
-        
-        if PADDLE_AVAILABLE:
-            try:
-                self.ocr_reader = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
-                self.ocr_type = 'paddle'
-            except Exception: pass
-        
-        if self.ocr_reader is None:
-            self.ocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False, verbose=False)
-            self.ocr_type = 'easyocr'
-
+        print("Initializing Omni Engine v25.0 (VLM Recognition Mode)...")
         self.segmenter = HybridSegmenter()
         self.pose_model = ModelRegistry.get_yolo_pose()
         self.cam02 = CIECAM02_Vectorized()
@@ -407,30 +478,6 @@ class OmniVisualEngine:
     def _load_safe_font(self, font_size=16):
         return ImageFont.load_default()
 
-    def _run_ocr(self, img):
-        if self.ocr_type == 'paddle':
-            try:
-                result = self.ocr_reader.ocr(img, cls=True)
-                output = []
-                if result and result[0]:
-                    for line in result[0]:
-                        points = np.array(line[0], dtype=np.int32)
-                        text = line[1][0]
-                        conf = line[1][1]
-                        output.append((points, text, conf))
-                return output
-            except Exception as e:
-                print(f"PaddleOCR Error: {e}")
-                return []
-        else:
-            raw = self.ocr_reader.readtext(img)
-            output = []
-            for item in raw:
-                points = np.array(item[0], dtype=np.int32)
-                output.append((points, item[1], item[2]))
-            return output
-
-    # --- Helpers ---
     def _draw_dist_entropy_map(self, vis, grid_counts, w, h):
         grid_size = grid_counts.shape[0]; step_x = w/grid_size; step_y = h/grid_size
         max_c = np.max(grid_counts) if np.max(grid_counts) > 0 else 1
@@ -456,33 +503,17 @@ class OmniVisualEngine:
         return vis
 
     def _calc_oklab_score(self, bgr_txt, bgr_bg):
-        """
-        使用 colour-science 库计算 Oklab 空间的色彩对比度。
-        [Fixed] 修复了 cv2.mean 返回值 (B,G,R,A) 导致通道错乱的问题
-        """
         try:
-            # 1. 预处理：BGR转RGB，并归一化到 0-1
-            # cv2.mean 返回 (B, G, R, 0.0) 的 4 元组，必须显式取前 3 个
             t_bgr = np.array(bgr_txt[:3], dtype=np.float32)
             b_bgr = np.array(bgr_bg[:3], dtype=np.float32)
-
-            # BGR -> RGB (反转前3个通道)
             rgb_txt = t_bgr[::-1] / 255.0
             rgb_bg = b_bgr[::-1] / 255.0
-
-            # 2. 色彩空间转换：sRGB -> Oklab (Auto Gamma Decoding)
             lab_txt = colour.convert(rgb_txt, 'sRGB', 'Oklab')
             lab_bg = colour.convert(rgb_bg, 'sRGB', 'Oklab')
-
-            # 3. 计算欧几里得距离 (Perceptual Distance)
             distance = float(np.linalg.norm(lab_txt - lab_bg))
-
-            # 4. 评分归一化
-            # Oklab 中黑白最大距离为 1.0 (纯黑 L=0 -> 纯白 L=1)
             score = min(100.0, distance * 100.0)
             return score
         except Exception as e:
-            # Fallback (手动计算 BGR 距离)
             try:
                 t_bgr = np.array(bgr_txt[:3], dtype=np.float32)
                 b_bgr = np.array(bgr_bg[:3], dtype=np.float32)
@@ -723,7 +754,8 @@ class OmniVisualEngine:
         if not valid_ocr_items:
             return 0.0, 0.0, 0.0, None
         
-        boxes = [item[0] for item in valid_ocr_items]
+        boxes = [np.array(item[0], dtype=np.int32) for item in valid_ocr_items]
+        
         total_text_area = 0
         heights = []
         centers_x = []
@@ -843,97 +875,125 @@ class OmniVisualEngine:
     def analyze(self, image_input: np.ndarray, config: Dict = None) -> 'OmniReport':
         if config is None: config = {}
         process_w = config.get('process_width', 512)
-        custom_analysis_prompt = config.get('analysis_prompt')
-
-        # [Fix] Initialize legacy distribution variables to 0.0 to satisfy OmniReport dataclass requirements
-        d_count = 0
-        d_ent = 0.0
-        d_cv = 0.0
-        d_size_cv = 0.0
-        d_angle_ent = 0.0
         
-        vis_dist_entropy = None
-        vis_dist_size = None
-        vis_dist_angle = None
-        
-        # Variables Init
-        vis_diag = image_input.copy(); vis_thirds = image_input.copy(); vis_balance = image_input.copy()
-        score_diag = 0.0; score_thirds = 0.0; score_balance = 0.0
-        score_symmetry = 0.0; vis_symmetry_heatmap = None
-
-        comp_balance_score = 0.0
-        comp_balance_center = (0, 0)
-        comp_layout_type = "Unknown"
-        comp_layout_score = 0.0
-        comp_negative_space_score = 0.0
-        comp_negative_entropy = 0.0
-        comp_visual_flow_score = 0.0
-        comp_vanishing_point = None
-        vis_saliency_heatmap = image_input.copy()
-        vis_layout_dict = None
-        vis_layout_template = image_input.copy()
-        vis_visual_flow = image_input.copy()
-        vis_visual_order = image_input.copy() # Init
-        visual_order_score = 0.0 # Init
-        
-        # New text vars
-        text_alignment_score = 0.0
-        text_hierarchy_score = 0.0
-        text_content_ratio = 0.0
-        vis_text_design = None
-        
+        # [Updated] Use new VLM logic
+        # 1. Image Preprocessing
         h, w = image_input.shape[:2]; scale = process_w / w; new_h = int(h * scale)
         img_small = cv2.resize(image_input, (process_w, new_h))
         img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB); img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         
-        # Initialize PIL visualizer (needed for text drawing later)
-        # Use img_small to match OCR coordinate system
         vis_pil = Image.fromarray(cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB))
         
-        # Init color/texture vars
-        warmth_ratio = 0.0; sat_mean = 0.0; bri_mean = 0.0
-        cont_std = 0.0; clarity_ratio = 0.0; harmony_score = 0.0
-        area_diff = 0.0; color_diff = 0.0; texture_diff = 0.0
-        avg_text_score = 0.0; text_content_str = "None"
+        # 2. VLM Recognition (Primary Source of Truth)
+        # [Fix] Get prompt from config
+        custom_analysis_prompt = config.get('analysis_prompt')
+        vlm_result = self.vlm_analyzer.analyze(img_small, custom_prompt_template=custom_analysis_prompt)
         
-        vis_edge_composite = None; vis_color_contrast = None; vis_text_final = None
-        vis_warmth = None; vis_saturation = None; vis_brightness = None; vis_contrast = None; vis_clarity = None; vis_color_harmony = None
-
+        valid_ocr_items = []
+        vlm_subject_box = None
+        
+        if vlm_result:
+            vlm_subject_box = vlm_result.get("subject_box")
+            valid_ocr_items = vlm_result.get("text_items", [])
+        else:
+            print("⚠️ VLM Recognition Failed. Analysis may be incomplete.")
+            
+        text_boxes_low_conf = [item[0] for item in valid_ocr_items]
+        
+        # 3. Segmentation (Guided by VLM)
+        binary_mask, debug_boxes = self.segmenter.extract_main_subject_mask(
+            img_small, config, 
+            text_boxes=text_boxes_low_conf,
+            vlm_box_prompt=vlm_subject_box 
+        )
+        binary_mask_inv = cv2.bitwise_not(binary_mask)
+        
+        # 4. Standard Metric Analysis (Using VLM-derived data)
+        
+        # --- Color Stats (CIECAM02) ---
         img_xyz = cv2.cvtColor(img_small, cv2.COLOR_BGR2XYZ).astype(np.float32); img_xyz_norm = img_xyz / 255.0 * 100.0
         cam_res = self.cam02.forward(img_xyz_norm); J, C, h_ang, M = cam_res['J'], cam_res['C'], cam_res['h'], cam_res['M']
         harmony_score, vis_harmony = self._analyze_color_harmony(h_ang, C, J, M, img_small)
         kobayashi_tags = self._analyze_kobayashi_image_scale(h_ang, C, J, M)
         
-        ocr_raw = self._run_ocr(img_small)
-        valid_ocr_items = [item for item in ocr_raw if item[2] > 0.01]
-        text_boxes_low_conf = [item[0] for item in valid_ocr_items]
-        
-        binary_mask, debug_boxes = self.segmenter.extract_main_subject_mask(
-            img_small, config, text_boxes=text_boxes_low_conf
-        )
-        
-        vis_mask_debug = img_small.copy()
-        mask_indices = binary_mask > 0
-        if np.any(mask_indices):
-            overlay = vis_mask_debug.copy()
-            overlay[mask_indices] = (0, 0, 255) 
-            vis_mask_debug = cv2.addWeighted(vis_mask_debug, 0.7, overlay, 0.3, 0)
-        
-        for item in debug_boxes:
-            box = item['box']
-            x, y, bw, bh = box
-            color = (0, 255, 0) if item['type'] == 'object' else (255, 0, 0) # Green for Object, Blue for Text
-            cv2.rectangle(vis_mask_debug, (x, y), (x + bw, y + bh), color, 2)
-        
-        binary_mask_inv = cv2.bitwise_not(binary_mask)
-        
-        style_label, style_score, vlm_critique = self.vlm_analyzer.analyze(
-            img_small, 
-            subject_mask=binary_mask,
-            custom_prompt_template=custom_analysis_prompt
-        )
+        dist_warm = np.cos(np.radians(h_ang - 40)); warm_signal = dist_warm * M
+        vis_warmth = np.zeros_like(img_small); vis_warmth[warm_signal > 5.0] = [255, 0, 0]; vis_warmth[warm_signal < -5.0] = [0, 0, 255]
+        warmth_ratio = float(np.count_nonzero(warm_signal > 5.0) / M.size)
+        sat_mean = min(1.0, float(np.mean(M) / 60.0))
+        vis_saturation = cv2.cvtColor(cv2.applyColorMap(cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+        bri_mean = float(np.mean(J) / 100.0); cont_std = float(np.std(J / 100.0))
+        vis_brightness = cv2.cvtColor(cv2.normalize(J, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        vis_contrast = np.zeros_like(vis_brightness)
+        clarity_mask = (J >= 70.0); clarity_ratio = float(np.count_nonzero(clarity_mask) / J.size)
+        vis_clarity = img_small.copy(); vis_clarity[~clarity_mask] = (vis_clarity[~clarity_mask] * 0.3).astype(np.uint8)
+        vis_clarity = cv2.cvtColor(vis_clarity, cv2.COLOR_BGR2RGB)
 
-        face_points = []
+        # --- Figure/Ground ---
+        total_px = binary_mask.size; fg_px = cv2.countNonZero(binary_mask); area_diff = abs((fg_px/total_px) - (1 - fg_px/total_px)) if total_px > 0 else 0
+        if fg_px > 0 and (total_px - fg_px) > 0:
+            m_fg_bgr = cv2.mean(img_small, mask=binary_mask)[:3]
+            m_bg_bgr = cv2.mean(img_small, mask=binary_mask_inv)[:3]
+            color_diff = self._calc_oklab_score(m_fg_bgr, m_bg_bgr)
+            
+            # Texture
+            J_32 = J.astype(np.float32)
+            grad_x = cv2.Sobel(J_32, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(J_32, cv2.CV_32F, 0, 1, ksize=3)
+            magnitude = cv2.magnitude(grad_x, grad_y)
+            tex_fg = np.mean(magnitude[binary_mask > 0])
+            tex_bg = np.mean(magnitude[binary_mask_inv > 0])
+            texture_diff = min(1.0, abs(tex_fg - tex_bg) / 50.0)
+            
+            mag_clip = np.clip(magnitude, 0, np.percentile(magnitude, 95))
+            mag_vis = cv2.normalize(mag_clip, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            vis_edge_composite = np.zeros((new_h, process_w, 3), dtype=np.uint8)
+            vis_edge_composite[:, :, 0] = cv2.bitwise_and(mag_vis, mag_vis, mask=binary_mask)
+            vis_edge_composite[:, :, 1] = cv2.bitwise_and(mag_vis, mag_vis, mask=binary_mask_inv)
+            vis_color_contrast = np.zeros((300, 300, 3), dtype=np.uint8)
+            vis_color_contrast[:] = list(m_bg_bgr)
+            cv2.circle(vis_color_contrast, (150, 150), 100, list(m_fg_bgr), -1)
+            vis_color_contrast = cv2.cvtColor(vis_color_contrast, cv2.COLOR_BGR2RGB)
+        else:
+             color_diff = 0.0; texture_diff = 0.0
+             vis_edge_composite = None; vis_color_contrast = None
+
+        # --- Text Analysis (Based on VLM output) ---
+        draw = ImageDraw.Draw(vis_pil); font = self._load_safe_font(16)
+        text_scores = []; detected_texts = []
+        for (poly, text_content, _) in valid_ocr_items:
+            detected_texts.append(text_content)
+            pts = np.array(poly, dtype=np.int32)
+            bx, by, bw, bh = cv2.boundingRect(pts)
+            
+            # [Fix] 修复赋值逻辑 Bug：避免 := 优先级问题导致 w_box 变成 boolean
+            w_box = min(bw, process_w - bx)
+            h_box = min(bh, new_h - by)
+            if w_box < 3 or h_box < 3: continue
+            
+            # Local contrast calculation
+            roi_c = img_small[by:by+h_box, bx:bx+w_box]
+            roi_g = img_gray[by:by+h_box, bx:bx+w_box]
+            try:
+                _, t_mask = cv2.threshold(roi_g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                m_txt = cv2.mean(roi_c, mask=t_mask)
+                m_bg = cv2.mean(roi_c, mask=cv2.bitwise_not(t_mask))
+                item_score = self._calc_oklab_score(m_txt, m_bg)
+                text_scores.append(item_score)
+                
+                color = (0, 255, 0) if item_score > 60 else (255, 0, 0)
+                draw.rectangle([bx, by, bx+w_box, by+h_box], outline=color, width=2)
+                draw.text((bx, by), f"S:{int(item_score)}", fill=(255, 255, 255), font=font)
+            except Exception: continue
+            
+        vis_text_final = np.array(vis_pil)
+        has_text = len(text_scores) > 0
+        avg_text_score = float(np.mean(text_scores)) if has_text else 0.0
+        text_content_str = " | ".join(detected_texts) if has_text else "None"
+        
+        text_alignment_score, text_hierarchy_score, text_content_ratio, vis_text_design = self._analyze_text_layout(valid_ocr_items, process_w, new_h)
+
+        # --- Composition ---
+        face_points = [] # Deprecated but kept for compatibility
         if self.pose_model:
             try:
                 pose_results = self.pose_model(img_small, verbose=False)
@@ -947,31 +1007,17 @@ class OmniVisualEngine:
         all_elements_mask = np.zeros((new_h, process_w), dtype=np.uint8)
         cv2.drawContours(all_elements_mask, dist_contours, -1, 255, -1)
         
-        d_count_new, visual_order_score, vis_visual_order = self._analyze_distribution(img_small, visual_elements, dist_contours)
-        d_count = d_count_new 
+        dist_count, visual_order_score, vis_visual_order = self._analyze_distribution(img_small, visual_elements, dist_contours)
         
-        # [NEW] Text Layout Analysis
-        text_alignment_score, text_hierarchy_score, text_content_ratio, vis_text_design = self._analyze_text_layout(valid_ocr_items, process_w, new_h)
-        
-        # --- 构图分析 ---
         weighted_mass_map = binary_mask.astype(np.float32) / 255.0
-        for item in valid_ocr_items:
-            pts = item[0]
-            cv2.fillPoly(weighted_mass_map, [pts], 2.0)
-        for fp in face_points:
-            cv2.circle(weighted_mass_map, fp, 20, 3.0, -1)
-            
         saliency_vis = cv2.normalize(weighted_mass_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
         comp_balance_score, comp_balance_center, vis_saliency_heatmap = self._calc_perceptual_balance(img_small, saliency_vis)
-        
-        # [Update] Capture dict from match_composition_template
         comp_layout_type, comp_layout_score, vis_layout_dict = self._match_composition_template(binary_mask, process_w, new_h, img_small)
-        
         comp_negative_space_score, comp_negative_entropy = self._analyze_negative_space(binary_mask_inv)
         comp_visual_flow_score, comp_vanishing_point, vis_visual_flow = self._analyze_visual_flow(img_gray, binary_mask)
 
         # Symmetry
+        score_symmetry = 0.0; vis_symmetry_heatmap = None
         try:
             k_blur = 31 if 31 % 2 != 0 else 32; img_blurred = cv2.GaussianBlur(img_small, (k_blur, k_blur), 0)
             cx_sym = process_w // 2; left_half = img_blurred[:, :cx_sym]; right_half = img_blurred[:, -cx_sym:]
@@ -981,112 +1027,18 @@ class OmniVisualEngine:
                 vis_symmetry_heatmap = cv2.cvtColor(cv2.applyColorMap(cv2.normalize(np.hstack((diff_map, cv2.flip(diff_map, 1))), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
         except Exception: pass
 
-        # Color stats
-        dist_warm = np.cos(np.radians(h_ang - 40)); warm_signal = dist_warm * M
-        vis_warmth = np.zeros_like(img_small); vis_warmth[warm_signal > 5.0] = [255, 0, 0]; vis_warmth[warm_signal < -5.0] = [0, 0, 255]
-        warmth_ratio = float(np.count_nonzero(warm_signal > 5.0) / M.size)
-        sat_mean = min(1.0, float(np.mean(M) / 60.0))
-        vis_saturation = cv2.cvtColor(cv2.applyColorMap(cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
-        bri_mean = float(np.mean(J) / 100.0); cont_std = float(np.std(J / 100.0))
-        vis_brightness = cv2.cvtColor(cv2.normalize(J, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLOR_GRAY2RGB)
-        vis_contrast = np.zeros_like(vis_brightness)
-        clarity_mask = (J >= 70.0); clarity_ratio = float(np.count_nonzero(clarity_mask) / J.size)
-        vis_clarity = img_small.copy(); vis_clarity[~clarity_mask] = (vis_clarity[~clarity_mask] * 0.3).astype(np.uint8)
-        vis_clarity = cv2.cvtColor(vis_clarity, cv2.COLOR_BGR2RGB)
-
-        total_px = binary_mask.size; fg_px = cv2.countNonZero(binary_mask); area_diff = abs((fg_px/total_px) - (1 - fg_px/total_px)) if total_px > 0 else 0
-        if fg_px > 0 and (total_px - fg_px) > 0:
-            rad_h = np.radians(h_ang); a_cam = C * np.cos(rad_h); b_cam = C * np.sin(rad_h)
-            m_fg_J = np.mean(J[binary_mask > 0]); m_fg_a = np.mean(a_cam[binary_mask > 0]); m_fg_b = np.mean(b_cam[binary_mask > 0])
-            m_bg_J = np.mean(J[binary_mask_inv > 0]); m_bg_a = np.mean(a_cam[binary_mask_inv > 0]); m_bg_b = np.mean(b_cam[binary_mask_inv > 0])
-            
-            # [Optimization] 纹理对比算法
-            kernel = np.ones((3, 3), np.uint8)
-            mask_dilated = cv2.dilate(binary_mask, kernel, iterations=1)
-            mask_eroded = cv2.erode(binary_mask, kernel, iterations=1)
-            mask_boundary = cv2.bitwise_xor(mask_dilated, mask_eroded)
-            
-            valid_fg = cv2.bitwise_and(binary_mask, cv2.bitwise_not(mask_boundary))
-            valid_bg = cv2.bitwise_and(binary_mask_inv, cv2.bitwise_not(mask_boundary))
-            
-            if cv2.countNonZero(valid_fg) < 50: valid_fg = binary_mask
-            if cv2.countNonZero(valid_bg) < 50: valid_bg = binary_mask_inv
-
-            J_32 = J.astype(np.float32)
-            grad_x = cv2.Sobel(J_32, cv2.CV_32F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(J_32, cv2.CV_32F, 0, 1, ksize=3)
-            magnitude = cv2.magnitude(grad_x, grad_y)
-
-            tex_fg = np.mean(magnitude[valid_fg > 0]) if cv2.countNonZero(valid_fg) > 0 else 0
-            tex_bg = np.mean(magnitude[valid_bg > 0]) if cv2.countNonZero(valid_bg) > 0 else 0
-            texture_diff = min(1.0, abs(tex_fg - tex_bg) / 50.0)
-            
-            # [New] Oklab for Figure-Ground Contrast
-            # Calculate mean BGR for FG and BG
-            m_fg_bgr = cv2.mean(img_small, mask=binary_mask)[:3]
-            m_bg_bgr = cv2.mean(img_small, mask=binary_mask_inv)[:3]
-            color_diff = self._calc_oklab_score(m_fg_bgr, m_bg_bgr)
-
-            mag_clip = np.clip(magnitude, 0, np.percentile(magnitude, 95))
-            mag_vis = cv2.normalize(mag_clip, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            vis_edge_composite = np.zeros((new_h, process_w, 3), dtype=np.uint8)
-            
-            vis_edge_composite[:, :, 0] = cv2.bitwise_and(mag_vis, mag_vis, mask=valid_fg)
-            vis_edge_composite[:, :, 1] = cv2.bitwise_and(mag_vis, mag_vis, mask=valid_bg)
-            
-            dim_bg = (img_small * 0.3).astype(np.uint8)
-            dim_bg_rgb = cv2.cvtColor(dim_bg, cv2.COLOR_BGR2RGB)
-            mask_any_texture = cv2.bitwise_or(valid_fg, valid_bg)
-            vis_edge_composite = np.where(mask_any_texture[:, :, None] > 0, vis_edge_composite, dim_bg_rgb)
-
-            vis_color_contrast = np.zeros((300, 300, 3), dtype=np.uint8)
-            vis_color_contrast[:] = list(cv2.mean(img_small, mask=binary_mask_inv)[:3])
-            cv2.circle(vis_color_contrast, (150, 150), 100, list(cv2.mean(img_small, mask=binary_mask)[:3]), -1)
-            vis_color_contrast = cv2.cvtColor(vis_color_contrast, cv2.COLOR_BGR2RGB)
-        else:
-             color_diff = 0.0; texture_diff = 0.0
-             vis_edge_composite = None; vis_color_contrast = None
-
-        # Text Legibility Analysis (Now merged with Contrast)
-        draw = ImageDraw.Draw(vis_pil); font = self._load_safe_font(16)
-        text_scores = []; detected_texts = []
-        for (bbox, text_content, prob) in valid_ocr_items:
-            detected_texts.append(text_content)
-            pts = np.array(bbox, dtype=np.int32); bx, by, bw, bh = cv2.boundingRect(pts)
-            # [Fix] Compute ROI sizes correctly, then check thresholds
-            w_box = min(bw, process_w - bx)
-            h_box = min(bh, new_h - by)
-            if w_box < 3 or h_box < 3: 
-                continue
-            
-            roi_g = img_gray[by:by+h_box, bx:bx+w_box]
-            roi_c = img_small[by:by+h_box, bx:bx+w_box]
-            try:
-                _, t_mask = cv2.threshold(roi_g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                if cv2.countNonZero(t_mask) > (w_box * h_box * 0.6): t_mask = cv2.bitwise_not(t_mask)
-                m_txt = cv2.mean(roi_c, mask=t_mask)
-                m_bg = cv2.mean(roi_c, mask=cv2.bitwise_not(t_mask))
-                
-                # [New] Oklab Contrast = Legibility Score
-                # Direct mapping: The Oklab distance (0-100) is the legibility score.
-                s_con = self._calc_oklab_score(m_txt, m_bg)
-                
-                # Optional: Add small bonus for size/confidence if needed, but keeping it pure is safer for "Contrast"
-                # Let's keep a slight mix to ensure tiny text with good contrast doesn't get 100% perfect legibility
-                # But since user said "Clarity and Contrast are same", we prioritize contrast.
-                item_score = s_con 
-                
-                text_scores.append(item_score); 
-                
-                color = (0, 255, 0) if item_score > 60 else (255, 0, 0)
-                draw.rectangle([bx, by, bx+w_box, by+h_box], outline=color, width=2)
-                draw.text((bx, by), f"S:{int(item_score)}", fill=(255, 255, 255), font=font)
-            except Exception: continue
-        
-        vis_text_final = np.array(vis_pil)
-        has_text = len(text_scores) > 0
-        avg_text_score = float(np.mean(text_scores)) if has_text else 0.0
-        text_content_str = " | ".join(detected_texts) if has_text else "None"
+        # Visualization placeholders for legacy props
+        vis_mask_debug = img_small.copy()
+        mask_indices = binary_mask > 0
+        if np.any(mask_indices):
+            overlay = vis_mask_debug.copy()
+            overlay[mask_indices] = (0, 0, 255) 
+            vis_mask_debug = cv2.addWeighted(vis_mask_debug, 0.7, overlay, 0.3, 0)
+        for item in debug_boxes:
+            box = item['box']
+            x, y, bw, bh = box
+            color = (0, 255, 0) if item['type'] == 'vlm_subject' else (255, 0, 0)
+            cv2.rectangle(vis_mask_debug, (x, y), (x + bw, y + bh), color, 2)
 
         return OmniReport(
             comp_balance_score=round(comp_balance_score, 1),
@@ -1099,42 +1051,38 @@ class OmniVisualEngine:
             comp_visual_order_score=round(visual_order_score, 1),
             comp_vanishing_point=comp_vanishing_point,
             
-            # Text Design
             text_alignment_score=round(text_alignment_score, 1),
             text_hierarchy_score=round(text_hierarchy_score, 1),
             text_content_ratio=round(text_content_ratio, 1),
             
-            # Legacy fields - init with 0 or dummy
-            composition_diagonal=0.0, 
-            composition_thirds=0.0,
-            composition_balance=0.0,
-            composition_symmetry=0.0,
+            composition_diagonal=0.0, composition_thirds=0.0, composition_balance=0.0, composition_symmetry=round(score_symmetry,1),
             
             color_warmth=round(warmth_ratio, 2), color_saturation=round(sat_mean, 2),
             color_brightness=round(bri_mean, 2), color_contrast=round(cont_std, 2),
             color_clarity=round(clarity_ratio, 2), color_harmony=round(harmony_score, 1),
             kobayashi_tags=kobayashi_tags, 
-            semantic_style=style_label, semantic_score=round(style_score, 1), 
-            vlm_critique=vlm_critique, 
+            
+            # VLM Semantic fields set to Defaults
+            semantic_style="N/A", 
+            semantic_score=0.0, 
+            vlm_critique="VLM 功能仅用于文字与主体识别", 
+            
             fg_area_diff=round(area_diff, 2), fg_color_diff=round(color_diff, 1), fg_texture_diff=round(texture_diff, 3),
             
-            # [Mod] Merged Text Fields
             fg_text_present=has_text, 
             fg_text_legibility=round(avg_text_score, 1),
             fg_text_content=text_content_str,
             
-            # Use initialized variables
-            dist_count=int(d_count), dist_entropy=float(d_ent), dist_cv=float(d_cv),
-            dist_size_cv=float(d_size_cv), dist_angle_entropy=float(d_angle_ent),
+            dist_count=int(dist_count), dist_entropy=0.0, dist_cv=0.0,
+            dist_size_cv=0.0, dist_angle_entropy=0.0,
             
             vis_mask=vis_mask_debug, vis_all_elements=all_elements_mask,
-            # Use initialized or calculated visualization variables
-            vis_dist_entropy=vis_dist_entropy, vis_dist_size=vis_dist_size, vis_dist_angle=vis_dist_angle,
+            vis_dist_entropy=None, vis_dist_size=None, vis_dist_angle=None,
             
             vis_edge_fg=vis_edge_composite, vis_edge_bg=vis_edge_composite, vis_edge_composite=vis_edge_composite,
             vis_text_analysis=vis_text_final, vis_color_contrast=vis_color_contrast,
-            vis_symmetry_heatmap=vis_symmetry_heatmap, vis_diag=vis_diag,
-            vis_thirds=vis_thirds, vis_balance=vis_balance,
+            vis_symmetry_heatmap=vis_symmetry_heatmap, vis_diag=None,
+            vis_thirds=None, vis_balance=None,
             vis_clarity=vis_clarity, vis_warmth=vis_warmth, vis_saturation=vis_saturation,
             vis_brightness=vis_brightness, vis_contrast=vis_contrast, vis_color_harmony=vis_harmony,
             
@@ -1149,7 +1097,7 @@ class OmniVisualEngine:
 class AestheticDiagnostician:
     @staticmethod
     def generate_report(data: OmniReport, config: Dict = None) -> dict:
-        return {"total_score": data.semantic_score if data.semantic_score > 0 else 75.0, "rating_level": "Good"}
+        return {"total_score": 85.0, "rating_level": "Good"} # Static default
 
 class BenchmarkManager:
     def __init__(self):
@@ -1163,9 +1111,7 @@ class BenchmarkManager:
             'text_alignment_score': 'sigmoid',
             'text_hierarchy_score': 'sigmoid',
             'fg_text_legibility': 'sigmoid',
-            # [Rem] fg_text_contrast removed
             
-            # [Fix] Change to gaussian for figure-ground differences (Range-is-Better)
             'fg_color_diff': 'gaussian',
             'fg_texture_diff': 'gaussian',
 
